@@ -1,0 +1,26 @@
+[Unit]
+Description=Stablecoin depeg monitor
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=5min
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=depeg-monitor
+Group=depeg-monitor
+WorkingDirectory=/var/lib/depeg-monitor
+StateDirectory=depeg-monitor
+ExecStart=/usr/local/bin/depeg-monitor /etc/depeg-monitor/config.toml
+Restart=always
+RestartSec=5
+LogRateLimitIntervalSec=30s
+LogRateLimitBurst=100
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target

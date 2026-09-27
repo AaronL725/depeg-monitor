@@ -1,0 +1,5 @@
+/target/
+/state/
+/config.toml
+.env
+*.env

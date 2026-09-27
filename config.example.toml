@@ -1,0 +1,20 @@
+# Copy to config.toml and edit for this installation.
+# Fair price is fixed at 1 USDT; 1 bp = 0.01%.
+exchanges = ["binance", "okx", "bitget", "bybit", "gate"]
+stablecoins = ["USDC", "USDe", "DAI", "FDUSD", "PYUSD"]
+warning_bps = 50
+critical_bps = 100
+confirmation_seconds = 5
+reminder_seconds = 1800
+recovery_bps = 40
+recovery_seconds = 30
+max_quote_age_seconds = 15
+evaluation_interval_ms = 250
+market_refresh_seconds = 21600
+notification_queue_capacity = 128
+state_path = "state/alerts.json"
+
+[telegram]
+bot_token = "<YOUR_TELEGRAM_BOT_TOKEN>"
+access_password = "<YOUR_ACCESS_PASSWORD>"
+authorized_chats_path = "state/authorized_chats.json"
