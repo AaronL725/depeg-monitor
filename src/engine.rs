@@ -1,5 +1,5 @@
 use crate::{
-    alert::{Delivery, DeliveryAck, Direction, Level, Notification},
+    alert::{escape_html, Delivery, DeliveryAck, Notification},
     config::Config,
     market::{BookUpdate, FeedEvent, MarketInfo},
     state::{IncidentState, StateFile},
@@ -16,10 +16,9 @@ use tokio::sync::{mpsc, watch};
 
 #[derive(Default)]
 struct Incident {
-    warning_since: Option<Instant>,
-    critical_since: Option<Instant>,
+    confirmation_since: Option<Instant>,
     recovery_since: Option<Instant>,
-    notified_level: u8,
+    notified: bool,
     last_sent_at: Option<chrono::DateTime<Utc>>,
     next_retry_at: Option<Instant>,
     pending: bool,
@@ -35,7 +34,7 @@ struct EvaluationTime {
 impl From<IncidentState> for Incident {
     fn from(value: IncidentState) -> Self {
         Self {
-            notified_level: value.notified_level,
+            notified: value.notified,
             last_sent_at: value.last_sent_at,
             ..Self::default()
         }
@@ -47,7 +46,6 @@ pub struct Engine {
     markets: HashMap<String, MarketInfo>,
     books: HashMap<String, BookUpdate>,
     catalogued: HashSet<String>,
-    online: HashSet<String>,
     offline: HashSet<String>,
     stale: HashSet<String>,
     incidents: HashMap<String, Incident>,
@@ -71,7 +69,6 @@ impl Engine {
             markets: HashMap::new(),
             books: HashMap::new(),
             catalogued: HashSet::new(),
-            online: HashSet::new(),
             offline: HashSet::new(),
             stale: HashSet::new(),
             incidents: HashMap::new(),
@@ -98,27 +95,8 @@ impl Engine {
                 _ = &mut shutdown => return,
                 event = feeds.recv() => match event {
                     Some(FeedEvent::Markets { venue, markets }) => self.set_markets(&venue, markets),
-                    Some(FeedEvent::Book(book)) => {
-                        let key = market_key(&book.venue, &book.market.symbol);
-                        if self.markets.contains_key(&key) {
-                            self.online.insert(book.venue.clone());
-                            self.offline.remove(&book.venue);
-                            self.stale.remove(&key);
-                            match &book.quote {
-                                Ok(_) => { self.books.insert(key, book); }
-                                Err(reason) => {
-                                    self.books.remove(&key);
-                                    self.pause_incident(&key, Direction::Down);
-                                    self.pause_incident(&key, Direction::Up);
-                                    if self.stale.insert(key) {
-                                        eprintln!("[market] {} {} invalid: {reason}", book.venue, book.market.symbol);
-                                    }
-                                }
-                            }
-                        }
-                    }
+                    Some(FeedEvent::Book(book)) => self.update_book(book),
                     Some(FeedEvent::Offline { venue, reason }) => {
-                        self.online.remove(&venue);
                         self.offline.insert(venue.clone());
                         self.pause_venue(&venue);
                         eprintln!("[market] {venue} offline: {reason}");
@@ -141,61 +119,63 @@ impl Engine {
         let mut lines = vec!["📊 <b>MONITOR STATUS</b>".to_string()];
         for venue in &self.config.exchanges {
             let prefix = format!("{venue}|");
-            let total = self
+            let mut markets: Vec<_> = self
                 .markets
                 .iter()
                 .filter(|(key, _)| key.starts_with(&prefix))
-                .count();
-            let fresh = self
-                .books
-                .iter()
-                .filter(|(key, book)| {
-                    key.starts_with(&prefix)
-                        && self.online.contains(venue)
-                        && book.quote.is_ok()
-                        && now.duration_since(book.received_at) <= max_age
-                })
-                .count();
-            let needs_anchor = self
-                .markets
-                .iter()
-                .any(|(key, market)| key.starts_with(&prefix) && market.quote == "USDC");
-            let anchor_fresh = self.markets.iter().any(|(key, market)| {
-                key.starts_with(&prefix)
-                    && market.base == "USDC"
-                    && market.quote == "USDT"
-                    && self.online.contains(venue)
-                    && self.books.get(key).is_some_and(|book| {
-                        book.quote.is_ok() && now.duration_since(book.received_at) <= max_age
-                    })
-            });
+                .collect();
+            markets.sort_by_key(|(_, market)| market.display_base.as_str());
+            let total = markets.len();
+            let mut fresh = 0;
+            let mut received = false;
+            let mut market_status = Vec::with_capacity(total);
+            for (key, market) in markets {
+                let detail = if self.offline.contains(venue) {
+                    "offline".to_string()
+                } else if let Some(book) = self.books.get(key) {
+                    received = true;
+                    let age = now.duration_since(book.received_at);
+                    if book.quote.is_err() {
+                        format!("invalid {}s", age.as_secs())
+                    } else if age > max_age {
+                        format!("no update {}s", age.as_secs())
+                    } else {
+                        fresh += 1;
+                        format!("{}s", age.as_secs())
+                    }
+                } else {
+                    "waiting for L2".to_string()
+                };
+                market_status.push(format!(
+                    "{} / USDT: {detail}",
+                    escape_html(&market.display_base)
+                ));
+            }
             let state = if self.offline.contains(venue) {
                 "🔴 reconnecting"
             } else if total == 0 {
                 "⚪ waiting for markets"
-            } else if needs_anchor && !anchor_fresh {
-                "🟡 USDC anchor unavailable"
             } else if fresh == total {
                 "🟢 live"
             } else if fresh > 0 {
                 "🟡 partial"
-            } else if self.online.contains(venue) {
+            } else if received {
                 "🟠 no fresh L2"
             } else {
                 "🟡 waiting for L2"
             };
-            let mut coverage = if total == 0 {
+            let coverage = if total == 0 {
                 "0 spot pairs".to_string()
             } else {
                 format!("{fresh}/{total} L2 fresh")
             };
-            if needs_anchor && !anchor_fresh {
-                coverage.push_str("; USDC/USDT ask unavailable");
-            }
             lines.push(format!(
                 "{state} <b>{}</b> — {coverage}",
                 exchange_name(venue)
             ));
+            if total > 0 {
+                lines.push(format!("  {}", market_status.join(" · ")));
+            }
         }
         lines.join("\n")
     }
@@ -205,7 +185,6 @@ impl Engine {
     }
 
     fn set_markets(&mut self, venue: &str, markets: Vec<MarketInfo>) {
-        self.offline.remove(venue);
         self.catalogued.insert(venue.into());
         let count = markets.len();
         let symbols = markets
@@ -213,14 +192,15 @@ impl Engine {
             .map(|market| market.symbol.as_str())
             .collect::<Vec<_>>()
             .join(", ");
-        let retained: std::collections::HashSet<_> = markets
+        let venue_prefix = format!("{venue}|");
+        let retained: HashSet<_> = markets
             .iter()
             .map(|market| market_key(venue, &market.symbol))
             .collect();
         let removed: Vec<_> = self
             .markets
             .keys()
-            .filter(|key| key.starts_with(&format!("{venue}|")) && !retained.contains(*key))
+            .filter(|key| key.starts_with(&venue_prefix) && !retained.contains(*key))
             .cloned()
             .collect();
         if let Err(error) = self.state.retain_markets(venue, &retained) {
@@ -229,11 +209,10 @@ impl Engine {
         for key in removed {
             self.books.remove(&key);
             self.stale.remove(&key);
-            self.incidents.remove(&event_key(&key, Direction::Down));
-            self.incidents.remove(&event_key(&key, Direction::Up));
+            self.incidents.remove(&event_key(&key));
         }
         self.markets
-            .retain(|key, _| !key.starts_with(&format!("{venue}|")));
+            .retain(|key, _| !key.starts_with(&venue_prefix));
         for market in markets {
             self.markets
                 .insert(market_key(venue, &market.symbol), market);
@@ -242,17 +221,46 @@ impl Engine {
     }
 
     fn pause_venue(&mut self, venue: &str) {
+        let venue_prefix = format!("{venue}|");
         let keys: Vec<_> = self
             .markets
             .keys()
-            .filter(|key| key.starts_with(&format!("{venue}|")))
+            .filter(|key| key.starts_with(&venue_prefix))
             .cloned()
             .collect();
         for key in keys {
             self.stale.insert(key.clone());
-            self.pause_incident(&key, Direction::Down);
-            self.pause_incident(&key, Direction::Up);
+            self.books.remove(&key);
+            self.pause_incident(&key);
         }
+    }
+
+    fn update_book(&mut self, book: BookUpdate) {
+        let key = market_key(&book.venue, &book.market.symbol);
+        if !self.markets.contains_key(&key) {
+            return;
+        }
+        self.offline.remove(&book.venue);
+        match &book.quote {
+            Ok(_) => {
+                if self.stale.remove(&key) {
+                    eprintln!(
+                        "[market] {} {} L2 updates resumed",
+                        book.venue, book.market.symbol
+                    );
+                }
+            }
+            Err(reason) => {
+                self.pause_incident(&key);
+                if self.stale.insert(key.clone()) {
+                    eprintln!(
+                        "[market] {} {} invalid: {reason}",
+                        book.venue, book.market.symbol
+                    );
+                }
+            }
+        }
+        self.books.insert(key, book);
     }
 
     fn evaluate(&mut self) {
@@ -261,19 +269,6 @@ impl Engine {
         }
         let now = Instant::now();
         let fresh = Duration::from_secs(self.config.max_quote_age_seconds);
-        let mut anchor_by_venue = HashMap::new();
-        for book in self.books.values() {
-            if self.online.contains(&book.venue)
-                && book.market.base == "USDC"
-                && book.market.quote == "USDT"
-                && now.duration_since(book.received_at) <= fresh
-            {
-                if let Ok((_, ask)) = &book.quote {
-                    anchor_by_venue.insert(book.venue.clone(), (*ask, book.received_at));
-                }
-            }
-        }
-
         let monitored: Vec<_> = self
             .markets
             .iter()
@@ -285,84 +280,73 @@ impl Engine {
                 .get(&key)
                 .map(|book| (book.venue.clone(), book.quote.clone(), book.received_at))
             else {
-                self.pause_incident(&key, Direction::Down);
-                self.pause_incident(&key, Direction::Up);
+                self.pause_incident(&key);
                 continue;
             };
-            if !self.online.contains(&venue) || now.duration_since(received_at) > fresh {
+            let Ok((_, sell_price)) = quote else {
+                self.pause_incident(&key);
+                continue;
+            };
+            if now.duration_since(received_at) > fresh {
                 if self.stale.insert(key.clone()) {
-                    eprintln!("[market] {venue} {} data stale", market.symbol);
+                    eprintln!(
+                        "[market] {venue} {} no L2 update for {}s; alert paused",
+                        market.symbol,
+                        now.duration_since(received_at).as_secs()
+                    );
                 }
-                self.pause_incident(&key, Direction::Down);
-                self.pause_incident(&key, Direction::Up);
+                self.pause_incident(&key);
                 continue;
             }
-            let Ok((raw_bid, raw_ask)) = quote else {
-                self.pause_incident(&key, Direction::Down);
-                self.pause_incident(&key, Direction::Up);
-                continue;
-            };
-            let anchor = anchor_by_venue.get(&venue).copied();
-            let Some((bid, ask)) =
-                normalize_prices(&market, raw_bid, raw_ask, anchor.map(|(ask, _)| ask))
-            else {
-                self.pause_incident(&key, Direction::Down);
-                self.pause_incident(&key, Direction::Up);
-                continue;
-            };
-            let sampled_at = anchor
-                .map(|(_, time)| time.min(received_at))
-                .unwrap_or(received_at);
-            let time = EvaluationTime { now, sampled_at };
-            self.evaluate_direction(&key, &market, &venue, bid, Direction::Down, time);
-            self.evaluate_direction(&key, &market, &venue, ask, Direction::Up, time);
+            self.evaluate_depeg(
+                &key,
+                &market,
+                &venue,
+                sell_price,
+                EvaluationTime {
+                    now,
+                    sampled_at: received_at,
+                },
+            );
         }
     }
 
-    fn pause_incident(&mut self, key: &str, direction: Direction) {
-        let id = event_key(key, direction);
+    fn pause_incident(&mut self, key: &str) {
+        let id = event_key(key);
         if let Some(incident) = self.incidents.get_mut(&id) {
-            incident.warning_since = None;
-            incident.critical_since = None;
+            incident.confirmation_since = None;
             incident.recovery_since = None;
         }
     }
 
-    fn evaluate_direction(
+    fn evaluate_depeg(
         &mut self,
         source_key: &str,
         market: &MarketInfo,
         venue: &str,
         price: Decimal,
-        direction: Direction,
         time: EvaluationTime,
     ) {
         let EvaluationTime { now, sampled_at } = time;
-        let Some(deviation_bps) = price
-            .checked_sub(Decimal::ONE)
+        let Some(depeg_bps) = Decimal::ONE
+            .checked_sub(price)
             .and_then(|deviation| deviation.checked_mul(Decimal::from(10_000)))
         else {
-            self.pause_incident(source_key, direction);
+            self.pause_incident(source_key);
             return;
         };
-        let directional_bps = match direction {
-            Direction::Down if deviation_bps < Decimal::ZERO => -deviation_bps,
-            Direction::Up if deviation_bps > Decimal::ZERO => deviation_bps,
-            _ => Decimal::ZERO,
-        };
-        let critical = directional_bps >= Decimal::from(self.config.critical_bps);
-        let warning = directional_bps >= Decimal::from(self.config.warning_bps);
-        let recovered = directional_bps < Decimal::from(self.config.recovery_bps);
-        let id = event_key(source_key, direction);
+        let depeg_bps = depeg_bps.max(Decimal::ZERO);
+        let triggered = depeg_bps >= Decimal::from(self.config.depeg_bps);
+        let recovered = depeg_bps < Decimal::from(self.config.recovery_bps);
+        let id = event_key(source_key);
         let incident = self
             .incidents
             .entry(id.clone())
             .or_insert_with(|| self.state.get(&id).into());
 
         if recovered {
-            incident.warning_since = None;
-            incident.critical_since = None;
-            if incident.notified_level == 0
+            incident.confirmation_since = None;
+            if !incident.notified
                 && !incident.pending
                 && !incident.permanently_failed
                 && incident.next_retry_at.is_none()
@@ -383,47 +367,22 @@ impl Engine {
             return;
         }
         incident.recovery_since = None;
-        if warning {
-            incident.warning_since.get_or_insert(now);
+        if triggered {
+            incident.confirmation_since.get_or_insert(now);
         } else {
-            incident.warning_since = None;
+            incident.confirmation_since = None;
         }
-        if critical {
-            incident.critical_since.get_or_insert(now);
-        } else {
-            incident.critical_since = None;
-        }
-
-        let warning_confirmed = incident.warning_since.is_some_and(|since| {
+        let confirmed = incident.confirmation_since.is_some_and(|since| {
             now.duration_since(since) >= Duration::from_secs(self.config.confirmation_seconds)
         });
-        let critical_confirmed = incident.critical_since.is_some_and(|since| {
-            now.duration_since(since) >= Duration::from_secs(self.config.confirmation_seconds)
-        });
-        let current_level = if critical_confirmed {
-            Some(Level::Critical)
-        } else if warning_confirmed {
-            Some(Level::Warning)
-        } else {
-            None
-        };
-
-        let next = if critical_confirmed && incident.notified_level < 2 {
-            Some(Level::Critical)
-        } else if warning_confirmed && incident.notified_level == 0 {
-            Some(Level::Warning)
-        } else if incident.notified_level > 0
-            && current_level.is_some()
+        let reminder_due = incident.notified
             && incident.last_sent_at.is_some_and(|sent| {
                 (Utc::now() - sent).to_std().unwrap_or_default()
                     >= Duration::from_secs(self.config.reminder_seconds)
-            })
-        {
-            current_level
-        } else {
-            None
-        };
-        let Some(level) = next else { return };
+            });
+        if !confirmed || (incident.notified && !reminder_due) {
+            return;
+        }
         if self.authorized_chats.borrow().is_empty() {
             return;
         }
@@ -434,18 +393,10 @@ impl Engine {
             return;
         }
 
-        let pair_label = if market.quote == "USDC" {
-            format!("{} → USDT", market.pair_label)
-        } else {
-            market.pair_label.clone()
-        };
         let message = Notification {
             key: id,
             base: market.display_base.clone(),
-            pair_label,
             exchange: exchange_name(venue),
-            direction,
-            level,
             price,
             confirmed_at: Utc::now(),
             sampled_at,
@@ -481,13 +432,13 @@ impl Engine {
         incident.pending = false;
         match ack.delivery {
             Delivery::Sent(sent_at) => {
-                incident.notified_level = incident.notified_level.max(ack.level.value());
+                incident.notified = true;
                 incident.last_sent_at = Some(sent_at);
                 incident.next_retry_at = None;
                 if let Err(error) = self.state.set(
                     ack.key,
                     IncidentState {
-                        notified_level: incident.notified_level,
+                        notified: incident.notified,
                         last_sent_at: incident.last_sent_at,
                     },
                 ) {
@@ -507,30 +458,12 @@ impl Engine {
     }
 }
 
-fn normalize_prices(
-    market: &MarketInfo,
-    bid: Decimal,
-    ask: Decimal,
-    usdc_usdt_ask: Option<Decimal>,
-) -> Option<(Decimal, Decimal)> {
-    let conversion = match market.quote.as_str() {
-        "USDT" => Decimal::ONE,
-        "USDC" => usdc_usdt_ask?,
-        _ => return None,
-    };
-    Some((bid.checked_mul(conversion)?, ask.checked_mul(conversion)?))
-}
-
 fn market_key(venue: &str, symbol: &str) -> String {
     format!("{venue}|{symbol}")
 }
 
-fn event_key(market_key: &str, direction: Direction) -> String {
-    let direction = match direction {
-        Direction::Down => "down",
-        Direction::Up => "up",
-    };
-    format!("{market_key}|{direction}")
+fn event_key(market_key: &str) -> String {
+    format!("{market_key}|down")
 }
 
 fn exchange_name(venue: &str) -> String {
@@ -559,12 +492,15 @@ mod tests {
     ) -> (Engine, mpsc::Receiver<Notification>, PathBuf) {
         let path =
             std::env::temp_dir().join(format!("depeg-engine-{}-{name}.json", std::process::id()));
+        let _ = fs::remove_file(&path);
         let state = StateFile::load(&path).unwrap();
         let (queue, receiver) = mpsc::channel(capacity);
         let (status, _status_receiver) = watch::channel(String::new());
         let (_authorized_sender, authorized_receiver) = watch::channel(vec![123]);
-        let mut config = Config::default();
-        config.reminder_seconds = 30;
+        let config = Config {
+            reminder_seconds: 30,
+            ..Config::default()
+        };
         (
             Engine::new(config, state, queue, status, authorized_receiver),
             receiver,
@@ -575,43 +511,41 @@ mod tests {
     fn market() -> MarketInfo {
         MarketInfo {
             symbol: "USDe/USDT".into(),
-            base: "USDE".into(),
             display_base: "USDe".into(),
-            quote: "USDT".into(),
-            pair_label: "USDe / USDT".into(),
         }
     }
 
-    #[test]
-    fn event_keys_keep_direction_and_venue_independent() {
-        assert_ne!(
-            event_key("binance|USDe/USDT", Direction::Down),
-            event_key("binance|USDe/USDT", Direction::Up)
-        );
-        assert_ne!(
-            event_key("binance|USDe/USDT", Direction::Down),
-            event_key("okx|USDe/USDT", Direction::Down)
+    fn dai_market() -> MarketInfo {
+        MarketInfo {
+            symbol: "DAI/USDT".into(),
+            display_base: "DAI".into(),
+        }
+    }
+
+    fn evaluate_at(
+        engine: &mut Engine,
+        market: &MarketInfo,
+        price: &str,
+        start: Instant,
+        sec: u64,
+    ) {
+        let at = start + Duration::from_secs(sec);
+        engine.evaluate_depeg(
+            "binance|USDe/USDT",
+            market,
+            "binance",
+            price.parse().unwrap(),
+            EvaluationTime {
+                now: at,
+                sampled_at: at,
+            },
         );
     }
 
     #[test]
-    fn usdc_conversion_uses_the_same_venue_sell_price() {
-        let mut target = market();
-        target.quote = "USDC".into();
-        target.pair_label = "USDe / USDC".into();
-        let (bid, ask) = normalize_prices(
-            &target,
-            "0.997".parse().unwrap(),
-            "1.001".parse().unwrap(),
-            Some("1.002".parse().unwrap()),
-        )
-        .unwrap();
-        assert_eq!(bid, "0.998994".parse().unwrap());
-        assert_eq!(ask, "1.003002".parse().unwrap());
-        assert!(normalize_prices(&target, bid, ask, None).is_none());
-        assert!(
-            normalize_prices(&target, Decimal::MAX, Decimal::MAX, Some(Decimal::from(2))).is_none()
-        );
+    fn event_keys_are_scoped_to_market_and_venue() {
+        assert_eq!(event_key("binance|USDe/USDT"), "binance|USDe/USDT|down");
+        assert_ne!(event_key("binance|USDe/USDT"), event_key("okx|USDe/USDT"));
     }
 
     #[test]
@@ -620,237 +554,180 @@ mod tests {
         for venue in ["binance", "okx", "bitget", "bybit", "gate"] {
             engine.offline.insert(venue.into());
         }
-        let direct = market();
-        let key = market_key("binance", &direct.symbol);
-        engine.set_markets("binance", vec![direct.clone()]);
-        engine.online.insert("binance".into());
-        engine.books.insert(
-            key,
-            BookUpdate {
-                venue: "binance".into(),
-                market: direct,
-                quote: Ok(("0.999".parse().unwrap(), "1.001".parse().unwrap())),
-                received_at: Instant::now(),
-            },
-        );
+        let market = market();
+        engine.set_markets("binance", vec![market.clone()]);
+        engine.update_book(BookUpdate {
+            venue: "binance".into(),
+            market,
+            quote: Ok(("0.999".parse().unwrap(), "1.001".parse().unwrap())),
+            received_at: Instant::now(),
+        });
         let status = engine.status_text();
         for name in ["Binance", "OKX", "Bitget", "Bybit", "Gate"] {
             assert!(status.contains(name));
         }
         assert!(status.contains("live <b>Binance</b> — 1/1 L2 fresh"));
+        assert!(status.contains("USDe / USDT: 0s"));
         assert!(status.contains("reconnecting <b>Bitget</b> — 0 spot pairs"));
-
-        let mut cross = market();
-        cross.symbol = "USDe/USDC".into();
-        cross.quote = "USDC".into();
-        cross.pair_label = "USDe / USDC".into();
-        let cross_key = market_key("binance", &cross.symbol);
-        engine.markets.insert(cross_key.clone(), cross.clone());
-        engine.books.insert(
-            cross_key,
-            BookUpdate {
-                venue: "binance".into(),
-                market: cross,
-                quote: Ok(("0.99".parse().unwrap(), "1.01".parse().unwrap())),
-                received_at: Instant::now(),
-            },
-        );
-        let status = engine.status_text();
-        assert!(status.contains("USDC anchor unavailable <b>Binance</b>"));
-        assert!(status.contains("USDC/USDT ask unavailable"));
-
-        let anchor = MarketInfo {
-            symbol: "USDC/USDT".into(),
-            base: "USDC".into(),
-            display_base: "USDC".into(),
-            quote: "USDT".into(),
-            pair_label: "USDC / USDT".into(),
-        };
-        let anchor_key = market_key("binance", &anchor.symbol);
-        engine.markets.insert(anchor_key.clone(), anchor.clone());
-        engine.books.insert(
-            anchor_key,
-            BookUpdate {
-                venue: "binance".into(),
-                market: anchor,
-                quote: Ok(("1.001".parse().unwrap(), "1.002".parse().unwrap())),
-                received_at: Instant::now(),
-            },
-        );
-        assert!(engine
-            .status_text()
-            .contains("live <b>Binance</b> — 3/3 L2 fresh"));
         let _ = fs::remove_file(path);
     }
 
     #[test]
-    fn active_depeg_is_sent_after_a_chat_is_authorized() {
-        let path = std::env::temp_dir().join(format!(
-            "depeg-engine-{}-authorization.json",
-            std::process::id()
-        ));
-        let state = StateFile::load(&path).unwrap();
-        let (sender, mut queue) = mpsc::channel(8);
-        let (status, _status_receiver) = watch::channel(String::new());
-        let (authorized_sender, authorized_receiver) = watch::channel(Vec::new());
-        let mut engine = Engine::new(
-            Config::default(),
-            state,
-            sender,
-            status,
-            authorized_receiver,
-        );
-        let market = market();
-        let source = "binance|USDe/USDT";
-        let start = Instant::now();
-        for seconds in [0, 5] {
-            engine.evaluate_direction(
-                source,
-                &market,
-                "binance",
-                "0.994".parse().unwrap(),
-                Direction::Down,
-                EvaluationTime {
-                    now: start + Duration::from_secs(seconds),
-                    sampled_at: start,
+    fn status_identifies_each_stale_market_and_its_age() {
+        let (mut engine, _queue, path) = engine("market-status");
+        let stable = market();
+        let quiet = dai_market();
+        engine.set_markets("binance", vec![stable.clone(), quiet.clone()]);
+        for (market, age) in [(stable, Duration::ZERO), (quiet, Duration::from_secs(20))] {
+            let key = market_key("binance", &market.symbol);
+            engine.books.insert(
+                key,
+                BookUpdate {
+                    venue: "binance".into(),
+                    market,
+                    quote: Ok(("0.999".parse().unwrap(), "1.001".parse().unwrap())),
+                    received_at: Instant::now() - age,
                 },
             );
         }
-        assert!(queue.try_recv().is_err());
-        authorized_sender.send_replace(vec![123]);
-        engine.evaluate_direction(
-            source,
-            &market,
-            "binance",
-            "0.994".parse().unwrap(),
-            Direction::Down,
-            EvaluationTime {
-                now: start + Duration::from_secs(6),
-                sampled_at: start + Duration::from_secs(6),
-            },
-        );
-        assert_eq!(queue.try_recv().unwrap().level, Level::Warning);
+
+        let status = engine.status_text();
+        assert!(status.contains("partial <b>Binance</b> — 1/2 L2 fresh"));
+        assert!(status.contains("DAI / USDT: no update 20s"));
+        assert!(status.contains("USDe / USDT: 0s"));
         let _ = fs::remove_file(path);
     }
 
     #[test]
-    fn stale_usdc_anchor_and_target_books_pause_confirmation() {
-        let (mut engine, mut queue, path) = engine("stale-cross");
-        let mut target = market();
-        target.symbol = "USDe/USDC".into();
-        target.quote = "USDC".into();
-        target.pair_label = "USDe / USDC".into();
-        let anchor = MarketInfo {
-            symbol: "USDC/USDT".into(),
-            base: "USDC".into(),
-            display_base: "USDC".into(),
-            quote: "USDT".into(),
-            pair_label: "USDC / USDT".into(),
-        };
-        let target_key = market_key("binance", &target.symbol);
-        let anchor_key = market_key("binance", &anchor.symbol);
-        let incident_key = event_key(&target_key, Direction::Down);
-        let now = Instant::now();
-        engine.markets.insert(target_key.clone(), target.clone());
-        engine.markets.insert(anchor_key.clone(), anchor.clone());
-        engine.online.insert("binance".into());
+    fn reconnect_requires_a_fresh_book_for_each_market() {
+        let (mut engine, _queue, path) = engine("market-resync");
+        let stable = market();
+        let dai = dai_market();
+        engine.set_markets("binance", vec![stable.clone(), dai.clone()]);
+        for market in [stable.clone(), dai] {
+            engine.update_book(BookUpdate {
+                venue: "binance".into(),
+                market,
+                quote: Ok(("0.999".parse().unwrap(), "1.001".parse().unwrap())),
+                received_at: Instant::now(),
+            });
+        }
+
+        engine.offline.insert("binance".into());
+        engine.pause_venue("binance");
+        assert!(engine.books.is_empty());
+        engine.set_markets("binance", vec![stable.clone(), dai_market()]);
+        assert!(engine.offline.contains("binance"));
+
+        engine.update_book(BookUpdate {
+            venue: "binance".into(),
+            market: stable,
+            quote: Ok(("0.999".parse().unwrap(), "1.001".parse().unwrap())),
+            received_at: Instant::now(),
+        });
+        assert!(!engine.stale.contains("binance|USDe/USDT"));
+        assert!(engine.stale.contains("binance|DAI/USDT"));
+        let status = engine.status_text();
+        assert!(status.contains("partial <b>Binance</b> — 1/2 L2 fresh"));
+        assert!(status.contains("DAI / USDT: waiting for L2"));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn only_the_sell_one_price_can_trigger_a_downward_alert() {
+        let (mut engine, mut queue, path) = engine("sell-one");
+        let market = market();
+        let key = market_key("binance", &market.symbol);
+        engine.set_markets("binance", vec![market.clone()]);
         engine.books.insert(
-            target_key.clone(),
+            key.clone(),
             BookUpdate {
                 venue: "binance".into(),
-                market: target.clone(),
-                quote: Ok(("0.94".parse().unwrap(), "0.96".parse().unwrap())),
-                received_at: now,
+                market,
+                quote: Ok(("0.95".parse().unwrap(), "1.0".parse().unwrap())),
+                received_at: Instant::now(),
             },
         );
+
+        engine.evaluate();
+        assert!(engine.incidents[&event_key(&key)]
+            .confirmation_since
+            .is_none());
+        assert!(queue.try_recv().is_err());
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn one_percent_sell_one_depeg_confirms_at_five_seconds() {
+        let (mut engine, mut queue, path) = engine("threshold");
+        let market = market();
+        let start = Instant::now();
+        for sec in [0, 4] {
+            evaluate_at(&mut engine, &market, "0.990", start, sec);
+        }
+        assert!(queue.try_recv().is_err());
+        evaluate_at(&mut engine, &market, "0.990", start, 5);
+        let alert = queue.try_recv().unwrap();
+        assert_eq!(alert.price, "0.990".parse().unwrap());
+        assert_eq!(alert.base, "USDe");
+        assert!(queue.try_recv().is_err());
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn ask_at_the_fair_price_side_does_not_start_a_downward_alert() {
+        let (mut engine, mut queue, path) = engine("fair-side");
+        let market = market();
+        let start = Instant::now();
+        evaluate_at(&mut engine, &market, "1.005", start, 0);
+        evaluate_at(&mut engine, &market, "1.005", start, 5);
+        assert!(queue.try_recv().is_err());
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn recovery_from_invalid_or_stale_book_restarts_confirmation() {
+        let (mut engine, mut queue, path) = engine("stale-book");
+        let market = market();
+        let key = market_key("binance", &market.symbol);
+        let now = Instant::now();
+        engine.set_markets("binance", vec![market.clone()]);
         engine.books.insert(
-            anchor_key.clone(),
+            key.clone(),
             BookUpdate {
                 venue: "binance".into(),
-                market: anchor,
-                quote: Ok(("1.001".parse().unwrap(), "1.002".parse().unwrap())),
+                market,
+                quote: Ok(("0.98".parse().unwrap(), "0.99".parse().unwrap())),
                 received_at: now - Duration::from_secs(16),
             },
         );
         engine.incidents.insert(
-            incident_key.clone(),
+            event_key(&key),
             Incident {
-                warning_since: Some(now - Duration::from_secs(6)),
-                critical_since: Some(now - Duration::from_secs(6)),
+                confirmation_since: Some(now - Duration::from_secs(6)),
                 ..Incident::default()
             },
         );
 
         engine.evaluate();
-        assert!(engine.incidents[&incident_key].warning_since.is_none());
-        assert!(queue.try_recv().is_err());
-
-        engine.books.get_mut(&anchor_key).unwrap().received_at = Instant::now();
-        engine.evaluate();
-        assert!(engine.incidents[&incident_key].warning_since.is_some());
-        assert!(queue.try_recv().is_err());
-
-        engine.books.get_mut(&target_key).unwrap().received_at =
-            Instant::now() - Duration::from_secs(16);
-        engine.evaluate();
-        assert!(engine.incidents[&incident_key].warning_since.is_none());
+        assert!(engine.incidents[&event_key(&key)]
+            .confirmation_since
+            .is_none());
         assert!(queue.try_recv().is_err());
         let _ = fs::remove_file(path);
     }
 
     #[test]
-    fn both_directions_confirm_at_the_exact_unrounded_threshold() {
-        let (mut engine, mut queue, path) = engine("thresholds");
+    fn brief_move_above_one_percent_resets_confirmation() {
+        let (mut engine, mut queue, path) = engine("threshold-reset");
         let market = market();
         let start = Instant::now();
-        for (source, price, direction) in [
-            ("binance|USDe/USDT|down-boundary", "0.995", Direction::Down),
-            ("binance|USDe/USDT|up-boundary", "1.005", Direction::Up),
-            ("binance|USDe/USDT|wrong-down", "1.010", Direction::Down),
-            ("binance|USDe/USDT|wrong-up", "0.990", Direction::Up),
-        ] {
-            engine.evaluate_direction(
-                source,
-                &market,
-                "binance",
-                price.parse().unwrap(),
-                direction,
-                EvaluationTime {
-                    now: start,
-                    sampled_at: start,
-                },
-            );
-            engine.evaluate_direction(
-                source,
-                &market,
-                "binance",
-                price.parse().unwrap(),
-                direction,
-                EvaluationTime {
-                    now: start + Duration::from_secs(4),
-                    sampled_at: start,
-                },
-            );
+        for (sec, price) in [(0, "0.989"), (4, "0.9900001"), (5, "0.989"), (9, "0.989")] {
+            evaluate_at(&mut engine, &market, price, start, sec);
         }
         assert!(queue.try_recv().is_err());
-        for (source, price, direction) in [
-            ("binance|USDe/USDT|down-boundary", "0.995", Direction::Down),
-            ("binance|USDe/USDT|up-boundary", "1.005", Direction::Up),
-        ] {
-            engine.evaluate_direction(
-                source,
-                &market,
-                "binance",
-                price.parse().unwrap(),
-                direction,
-                EvaluationTime {
-                    now: start + Duration::from_secs(5),
-                    sampled_at: start,
-                },
-            );
-        }
-        assert_eq!(queue.try_recv().unwrap().direction, Direction::Down);
-        assert_eq!(queue.try_recv().unwrap().direction, Direction::Up);
+        evaluate_at(&mut engine, &market, "0.989", start, 10);
+        assert_eq!(queue.try_recv().unwrap().price, "0.989".parse().unwrap());
         let _ = fs::remove_file(path);
     }
 
@@ -858,28 +735,25 @@ mod tests {
     fn decimal_overflow_pauses_confirmation_without_panicking() {
         let (mut engine, mut queue, path) = engine("decimal-overflow");
         let start = Instant::now();
-        let key = event_key("binance|USDe/USDT", Direction::Up);
+        let key = event_key("binance|USDe/USDT");
         engine.incidents.insert(
             key.clone(),
             Incident {
-                warning_since: Some(start - Duration::from_secs(6)),
-                critical_since: Some(start - Duration::from_secs(6)),
+                confirmation_since: Some(start - Duration::from_secs(6)),
                 ..Incident::default()
             },
         );
-        engine.evaluate_direction(
+        engine.evaluate_depeg(
             "binance|USDe/USDT",
             &market(),
             "binance",
             Decimal::MAX,
-            Direction::Up,
             EvaluationTime {
                 now: start,
                 sampled_at: start,
             },
         );
-        assert!(engine.incidents[&key].warning_since.is_none());
-        assert!(engine.incidents[&key].critical_since.is_none());
+        assert!(engine.incidents[&key].confirmation_since.is_none());
         assert!(queue.try_recv().is_err());
         let _ = fs::remove_file(path);
     }
@@ -889,30 +763,30 @@ mod tests {
         let (mut engine, mut queue, path) = engine_with_capacity("queue-full", 1);
         let market = market();
         let start = Instant::now();
-        for source in ["binance|USDe/USDT|first", "binance|USDe/USDT|second"] {
-            for seconds in [0, 5] {
-                engine.evaluate_direction(
-                    source,
+        for source in ["first", "second"] {
+            for sec in [0, 5] {
+                let at = start + Duration::from_secs(sec);
+                engine.evaluate_depeg(
+                    &format!("binance|USDe/USDT|{source}"),
                     &market,
                     "binance",
-                    "0.994".parse().unwrap(),
-                    Direction::Down,
+                    "0.989".parse().unwrap(),
                     EvaluationTime {
-                        now: start + Duration::from_secs(seconds),
-                        sampled_at: start,
+                        now: at,
+                        sampled_at: at,
                     },
                 );
             }
         }
         let first = queue.try_recv().unwrap();
-        let second_key = event_key("binance|USDe/USDT|second", Direction::Down);
+        let second_source = "binance|USDe/USDT|second";
+        let second_key = event_key(second_source);
         assert!(!engine.incidents[&second_key].pending);
-        engine.evaluate_direction(
-            "binance|USDe/USDT|second",
+        engine.evaluate_depeg(
+            second_source,
             &market,
             "binance",
-            "0.994".parse().unwrap(),
-            Direction::Down,
+            "0.989".parse().unwrap(),
             EvaluationTime {
                 now: start + Duration::from_secs(6),
                 sampled_at: start + Duration::from_secs(6),
@@ -925,282 +799,38 @@ mod tests {
     }
 
     #[test]
-    fn recovery_waits_until_a_queued_alert_has_an_acknowledgement() {
+    fn pending_alert_is_not_cleared_until_telegram_acknowledges_it() {
         let (mut engine, mut queue, path) = engine("pending-recovery");
         let market = market();
-        let source = "binance|USDe/USDT";
         let start = Instant::now();
-        for seconds in [0, 5] {
-            engine.evaluate_direction(
-                source,
-                &market,
-                "binance",
-                "0.994".parse().unwrap(),
-                Direction::Down,
-                EvaluationTime {
-                    now: start + Duration::from_secs(seconds),
-                    sampled_at: start,
-                },
-            );
-        }
+        evaluate_at(&mut engine, &market, "0.989", start, 0);
+        evaluate_at(&mut engine, &market, "0.989", start, 5);
         let alert = queue.try_recv().unwrap();
-        for seconds in [6, 36] {
-            engine.evaluate_direction(
-                source,
-                &market,
-                "binance",
-                "1.000".parse().unwrap(),
-                Direction::Down,
-                EvaluationTime {
-                    now: start + Duration::from_secs(seconds),
-                    sampled_at: start + Duration::from_secs(seconds),
-                },
-            );
-        }
+        evaluate_at(&mut engine, &market, "1.0", start, 6);
+        evaluate_at(&mut engine, &market, "1.0", start, 36);
         assert!(engine.incidents[&alert.key].pending);
         engine.delivery_ack(DeliveryAck {
             key: alert.key.clone(),
-            level: alert.level,
             delivery: Delivery::Stale,
         });
-        engine.evaluate_direction(
-            source,
-            &market,
-            "binance",
-            "1.000".parse().unwrap(),
-            Direction::Down,
-            EvaluationTime {
-                now: start + Duration::from_secs(37),
-                sampled_at: start + Duration::from_secs(37),
-            },
-        );
-        assert_eq!(engine.incidents[&alert.key].notified_level, 0);
+        evaluate_at(&mut engine, &market, "1.0", start, 37);
+        assert!(!engine.incidents[&alert.key].notified);
         assert!(!engine.incidents[&alert.key].pending);
         let _ = fs::remove_file(path);
     }
 
     #[test]
-    fn wide_spread_can_send_both_critical_directions_independently() {
-        let (mut engine, mut queue, path) = engine("wide-spread");
-        let market = market();
-        let source = "binance|USDe/USDT";
-        let start = Instant::now();
-        for seconds in [0, 4] {
-            engine.evaluate_direction(
-                source,
-                &market,
-                "binance",
-                "0.99".parse().unwrap(),
-                Direction::Down,
-                EvaluationTime {
-                    now: start + Duration::from_secs(seconds),
-                    sampled_at: start,
-                },
-            );
-            engine.evaluate_direction(
-                source,
-                &market,
-                "binance",
-                "1.01".parse().unwrap(),
-                Direction::Up,
-                EvaluationTime {
-                    now: start + Duration::from_secs(seconds),
-                    sampled_at: start,
-                },
-            );
-        }
-        assert!(queue.try_recv().is_err());
-        for (price, direction) in [("0.99", Direction::Down), ("1.01", Direction::Up)] {
-            engine.evaluate_direction(
-                source,
-                &market,
-                "binance",
-                price.parse().unwrap(),
-                direction,
-                EvaluationTime {
-                    now: start + Duration::from_secs(5),
-                    sampled_at: start,
-                },
-            );
-        }
-        let down = queue.try_recv().unwrap();
-        let up = queue.try_recv().unwrap();
-        assert_eq!(
-            (down.direction, down.level),
-            (Direction::Down, Level::Critical)
-        );
-        assert_eq!((up.direction, up.level), (Direction::Up, Level::Critical));
-        let _ = fs::remove_file(path);
-    }
-
-    #[test]
-    fn dropping_below_warning_resets_the_confirmation_timer() {
-        let (mut engine, mut queue, path) = engine("threshold-reset");
-        let market = market();
-        let source = "binance|USDe/USDT";
-        let start = Instant::now();
-        for (seconds, price) in [(0, "0.994"), (4, "0.9950001"), (5, "0.994"), (9, "0.994")] {
-            engine.evaluate_direction(
-                source,
-                &market,
-                "binance",
-                price.parse().unwrap(),
-                Direction::Down,
-                EvaluationTime {
-                    now: start + Duration::from_secs(seconds),
-                    sampled_at: start,
-                },
-            );
-        }
-        assert!(queue.try_recv().is_err());
-        engine.evaluate_direction(
-            source,
-            &market,
-            "binance",
-            "0.994".parse().unwrap(),
-            Direction::Down,
-            EvaluationTime {
-                now: start + Duration::from_secs(10),
-                sampled_at: start,
-            },
-        );
-        assert_eq!(queue.try_recv().unwrap().level, Level::Warning);
-        let _ = fs::remove_file(path);
-    }
-
-    #[test]
-    fn invalid_data_pause_restarts_confirmation_time() {
-        let (mut engine, mut queue, path) = engine("pause");
-        let market = market();
-        let start = Instant::now();
-        let source = "binance|USDe/USDT";
-        for seconds in [0, 4] {
-            engine.evaluate_direction(
-                source,
-                &market,
-                "binance",
-                "0.994".parse().unwrap(),
-                Direction::Down,
-                EvaluationTime {
-                    now: start + Duration::from_secs(seconds),
-                    sampled_at: start,
-                },
-            );
-        }
-        engine.pause_incident(source, Direction::Down);
-        engine.evaluate_direction(
-            source,
-            &market,
-            "binance",
-            "0.994".parse().unwrap(),
-            Direction::Down,
-            EvaluationTime {
-                now: start + Duration::from_secs(9),
-                sampled_at: start + Duration::from_secs(9),
-            },
-        );
-        assert!(queue.try_recv().is_err());
-        engine.evaluate_direction(
-            source,
-            &market,
-            "binance",
-            "0.994".parse().unwrap(),
-            Direction::Down,
-            EvaluationTime {
-                now: start + Duration::from_secs(14),
-                sampled_at: start + Duration::from_secs(14),
-            },
-        );
-        assert_eq!(queue.try_recv().unwrap().level, Level::Warning);
-        let _ = fs::remove_file(path);
-    }
-
-    #[test]
-    fn warning_confirms_after_five_seconds_and_critical_can_upgrade() {
-        let (mut engine, mut queue, path) = engine("upgrade");
-        let market = market();
-        let start = Instant::now();
-        engine.evaluate_direction(
-            "binance|USDe/USDT",
-            &market,
-            "binance",
-            "0.994".parse().unwrap(),
-            Direction::Down,
-            EvaluationTime {
-                now: start,
-                sampled_at: start,
-            },
-        );
-        engine.evaluate_direction(
-            "binance|USDe/USDT",
-            &market,
-            "binance",
-            "0.994".parse().unwrap(),
-            Direction::Down,
-            EvaluationTime {
-                now: start + Duration::from_secs(4),
-                sampled_at: start,
-            },
-        );
-        assert!(queue.try_recv().is_err());
-        engine.evaluate_direction(
-            "binance|USDe/USDT",
-            &market,
-            "binance",
-            "0.994".parse().unwrap(),
-            Direction::Down,
-            EvaluationTime {
-                now: start + Duration::from_secs(5),
-                sampled_at: start,
-            },
-        );
-        let warning = queue.try_recv().unwrap();
-        assert_eq!(warning.level, Level::Warning);
-        engine.delivery_ack(DeliveryAck {
-            key: warning.key,
-            level: warning.level,
-            delivery: Delivery::Sent(Utc::now()),
-        });
-        engine.evaluate_direction(
-            "binance|USDe/USDT",
-            &market,
-            "binance",
-            "0.989".parse().unwrap(),
-            Direction::Down,
-            EvaluationTime {
-                now: start + Duration::from_secs(6),
-                sampled_at: start + Duration::from_secs(6),
-            },
-        );
-        engine.evaluate_direction(
-            "binance|USDe/USDT",
-            &market,
-            "binance",
-            "0.989".parse().unwrap(),
-            Direction::Down,
-            EvaluationTime {
-                now: start + Duration::from_secs(11),
-                sampled_at: start + Duration::from_secs(11),
-            },
-        );
-        assert_eq!(queue.try_recv().unwrap().level, Level::Critical);
-        let _ = fs::remove_file(path);
-    }
-
-    #[test]
-    fn reminders_wait_for_the_interval_and_use_the_latest_price() {
-        let path = std::env::temp_dir().join(format!(
-            "depeg-engine-{}-restart-reminder.json",
-            std::process::id()
-        ));
+    fn reminders_use_the_latest_price_and_wait_for_the_interval() {
+        let path =
+            std::env::temp_dir().join(format!("depeg-engine-{}-reminder.json", std::process::id()));
         let _ = fs::remove_file(&path);
-        let key = event_key("binance|USDe/USDT", Direction::Down);
+        let key = event_key("binance|USDe/USDT");
         let mut state = StateFile::load(&path).unwrap();
         state
             .set(
                 key.clone(),
                 IncidentState {
-                    notified_level: 1,
+                    notified: true,
                     last_sent_at: Some(Utc::now()),
                 },
             )
@@ -1208,265 +838,65 @@ mod tests {
         let (sender, mut queue) = mpsc::channel(8);
         let (status, _status_receiver) = watch::channel(String::new());
         let (_authorized_sender, authorized_receiver) = watch::channel(vec![123]);
-        let mut config = Config::default();
-        config.reminder_seconds = 1800;
+        let config = Config {
+            reminder_seconds: 1800,
+            ..Config::default()
+        };
         let mut engine = Engine::new(config, state, sender, status, authorized_receiver);
         let market = market();
         let start = Instant::now();
-        engine.evaluate_direction(
-            "binance|USDe/USDT",
-            &market,
-            "binance",
-            "0.994".parse().unwrap(),
-            Direction::Down,
-            EvaluationTime {
-                now: start,
-                sampled_at: start,
-            },
-        );
-        engine.evaluate_direction(
-            "binance|USDe/USDT",
-            &market,
-            "binance",
-            "0.994".parse().unwrap(),
-            Direction::Down,
-            EvaluationTime {
-                now: start + Duration::from_secs(5),
-                sampled_at: start,
-            },
-        );
+        for sec in [0, 5] {
+            evaluate_at(&mut engine, &market, "0.989", start, sec);
+        }
         assert!(queue.try_recv().is_err());
-        assert_eq!(engine.incidents[&key].notified_level, 1);
-
         engine.incidents.get_mut(&key).unwrap().last_sent_at =
             Some(Utc::now() - chrono::Duration::minutes(31));
-        engine.evaluate_direction(
-            "binance|USDe/USDT",
-            &market,
-            "binance",
-            "0.993".parse().unwrap(),
-            Direction::Down,
-            EvaluationTime {
-                now: start + Duration::from_secs(6),
-                sampled_at: start + Duration::from_secs(6),
-            },
-        );
+        evaluate_at(&mut engine, &market, "0.988", start, 6);
         let reminder = queue.try_recv().unwrap();
-        assert_eq!(reminder.level, Level::Warning);
-        assert_eq!(reminder.price, "0.993".parse().unwrap());
-        engine.delivery_ack(DeliveryAck {
-            key: reminder.key,
-            level: reminder.level,
-            delivery: Delivery::Sent(Utc::now()),
-        });
-        engine.evaluate_direction(
-            "binance|USDe/USDT",
-            &market,
-            "binance",
-            "0.992".parse().unwrap(),
-            Direction::Down,
-            EvaluationTime {
-                now: start + Duration::from_secs(7),
-                sampled_at: start + Duration::from_secs(7),
-            },
-        );
-        assert!(queue.try_recv().is_err());
+        assert_eq!(reminder.price, "0.988".parse().unwrap());
         let _ = fs::remove_file(path);
     }
 
     #[test]
-    fn recovery_requires_thirty_seconds_below_four_basis_points() {
+    fn recovery_requires_thirty_seconds_strictly_below_four_bps() {
         let (mut engine, _queue, path) = engine("recovery");
         let market = market();
-        let key = "binance|USDe/USDT|down".to_string();
+        let key = event_key("binance|USDe/USDT");
         engine.delivery_ack(DeliveryAck {
             key: key.clone(),
-            level: Level::Warning,
             delivery: Delivery::Sent(Utc::now()),
         });
         let start = Instant::now();
-        for seconds in [0, 31] {
-            engine.evaluate_direction(
-                "binance|USDe/USDT",
-                &market,
-                "binance",
-                "0.996".parse().unwrap(),
-                Direction::Down,
-                EvaluationTime {
-                    now: start + Duration::from_secs(seconds),
-                    sampled_at: start + Duration::from_secs(seconds),
-                },
-            );
-        }
-        let event = event_key("binance|USDe/USDT", Direction::Down);
-        assert_eq!(engine.incidents[&event].notified_level, 1);
-        for seconds in [32, 61] {
-            engine.evaluate_direction(
-                "binance|USDe/USDT",
-                &market,
-                "binance",
-                "0.9961".parse().unwrap(),
-                Direction::Down,
-                EvaluationTime {
-                    now: start + Duration::from_secs(seconds),
-                    sampled_at: start + Duration::from_secs(seconds),
-                },
-            );
-        }
-        assert_eq!(engine.incidents[&event].notified_level, 1);
-        engine.evaluate_direction(
-            "binance|USDe/USDT",
-            &market,
-            "binance",
-            "0.9961".parse().unwrap(),
-            Direction::Down,
-            EvaluationTime {
-                now: start + Duration::from_secs(62),
-                sampled_at: start + Duration::from_secs(62),
-            },
-        );
-        assert_eq!(engine.incidents[&event].notified_level, 0);
+        evaluate_at(&mut engine, &market, "0.996", start, 0);
+        evaluate_at(&mut engine, &market, "0.996", start, 30);
+        assert!(engine.incidents[&key].notified);
+        evaluate_at(&mut engine, &market, "0.9961", start, 31);
+        evaluate_at(&mut engine, &market, "0.9961", start, 60);
+        assert!(engine.incidents[&key].notified);
+        evaluate_at(&mut engine, &market, "0.9961", start, 61);
+        assert!(!engine.incidents[&key].notified);
         let _ = fs::remove_file(path);
     }
 
     #[test]
-    fn opposite_side_price_recovers_the_incident_direction() {
-        let (mut engine, _queue, path) = engine("opposite-recovery");
-        let market = market();
-        let key = "binance|USDe/USDT|down".to_string();
-        engine.delivery_ack(DeliveryAck {
-            key: key.clone(),
-            level: Level::Warning,
-            delivery: Delivery::Sent(Utc::now()),
-        });
-        let start = Instant::now();
-        for seconds in [0, 29] {
-            engine.evaluate_direction(
-                "binance|USDe/USDT",
-                &market,
-                "binance",
-                "1.005".parse().unwrap(),
-                Direction::Down,
-                EvaluationTime {
-                    now: start + Duration::from_secs(seconds),
-                    sampled_at: start + Duration::from_secs(seconds),
-                },
-            );
-        }
-        let event = event_key("binance|USDe/USDT", Direction::Down);
-        assert_eq!(engine.incidents[&event].notified_level, 1);
-        engine.evaluate_direction(
-            "binance|USDe/USDT",
-            &market,
-            "binance",
-            "1.005".parse().unwrap(),
-            Direction::Down,
-            EvaluationTime {
-                now: start + Duration::from_secs(30),
-                sampled_at: start + Duration::from_secs(30),
-            },
-        );
-        assert_eq!(engine.incidents[&event].notified_level, 0);
-        let _ = fs::remove_file(path);
-    }
-
-    #[test]
-    fn failed_notification_does_not_mark_an_alert_as_sent() {
+    fn failed_notification_does_not_mark_alert_as_sent() {
         let (mut engine, mut queue, path) = engine("failed-send");
         let market = market();
         let start = Instant::now();
-        for seconds in [0, 5] {
-            engine.evaluate_direction(
-                "binance|USDe/USDT",
-                &market,
-                "binance",
-                "0.994".parse().unwrap(),
-                Direction::Down,
-                EvaluationTime {
-                    now: start + Duration::from_secs(seconds),
-                    sampled_at: start,
-                },
-            );
-        }
-        let warning = queue.try_recv().unwrap();
+        evaluate_at(&mut engine, &market, "0.989", start, 0);
+        evaluate_at(&mut engine, &market, "0.989", start, 5);
+        let alert = queue.try_recv().unwrap();
         engine.delivery_ack(DeliveryAck {
-            key: warning.key.clone(),
-            level: warning.level,
+            key: alert.key.clone(),
             delivery: Delivery::Permanent("HTTP 401".into()),
         });
-        assert_eq!(engine.incidents[&warning.key].notified_level, 0);
-        assert!(engine.incidents[&warning.key].permanently_failed);
-        for seconds in [6, 36] {
-            engine.evaluate_direction(
-                "binance|USDe/USDT",
-                &market,
-                "binance",
-                "0.997".parse().unwrap(),
-                Direction::Down,
-                EvaluationTime {
-                    now: start + Duration::from_secs(seconds),
-                    sampled_at: start + Duration::from_secs(seconds),
-                },
-            );
-        }
-        assert!(!engine.incidents[&warning.key].permanently_failed);
+        assert!(!engine.incidents[&alert.key].notified);
+        assert!(engine.incidents[&alert.key].permanently_failed);
         let _ = fs::remove_file(path);
     }
 
     #[test]
-    fn retryable_delivery_waits_for_retry_after_without_marking_sent() {
-        let (mut engine, mut queue, path) = engine("retryable-send");
-        let market = market();
-        let source = "binance|USDe/USDT";
-        let start = Instant::now();
-        for seconds in [0, 5] {
-            engine.evaluate_direction(
-                source,
-                &market,
-                "binance",
-                "0.994".parse().unwrap(),
-                Direction::Down,
-                EvaluationTime {
-                    now: start + Duration::from_secs(seconds),
-                    sampled_at: start,
-                },
-            );
-        }
-        let warning = queue.try_recv().unwrap();
-        engine.delivery_ack(DeliveryAck {
-            key: warning.key.clone(),
-            level: warning.level,
-            delivery: Delivery::Retryable {
-                reason: "HTTP 429".into(),
-                after: Duration::from_secs(30),
-            },
-        });
-        assert_eq!(engine.incidents[&warning.key].notified_level, 0);
-        let retry_at = engine.incidents[&warning.key].next_retry_at.unwrap();
-        for now in [retry_at - Duration::from_secs(1), retry_at] {
-            engine.evaluate_direction(
-                source,
-                &market,
-                "binance",
-                "0.993".parse().unwrap(),
-                Direction::Down,
-                EvaluationTime {
-                    now: now,
-                    sampled_at: now,
-                },
-            );
-            if now < retry_at {
-                assert!(queue.try_recv().is_err());
-            }
-        }
-        let retry = queue.try_recv().unwrap();
-        assert_eq!(retry.level, Level::Warning);
-        assert_eq!(retry.price, "0.993".parse().unwrap());
-        let _ = fs::remove_file(path);
-    }
-
-    #[test]
-    fn state_save_failure_does_not_undo_a_successful_delivery() {
+    fn state_save_failure_does_not_undo_successful_delivery() {
         let directory = std::env::temp_dir().join(format!(
             "depeg-engine-{}-state-save-failure",
             std::process::id()
@@ -1486,13 +916,12 @@ mod tests {
             status,
             authorized_receiver,
         );
-        let key = event_key("binance|USDe/USDT", Direction::Down);
+        let key = event_key("binance|USDe/USDT");
         engine.delivery_ack(DeliveryAck {
             key: key.clone(),
-            level: Level::Warning,
             delivery: Delivery::Sent(Utc::now()),
         });
-        assert_eq!(engine.incidents[&key].notified_level, 1);
+        assert!(engine.incidents[&key].notified);
         fs::remove_dir_all(directory).unwrap();
     }
 }

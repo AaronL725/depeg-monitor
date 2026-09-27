@@ -10,35 +10,11 @@ use std::{
 };
 use tokio::sync::{mpsc, watch};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Direction {
-    Down,
-    Up,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Level {
-    Warning,
-    Critical,
-}
-
-impl Level {
-    pub fn value(self) -> u8 {
-        match self {
-            Self::Warning => 1,
-            Self::Critical => 2,
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct Notification {
     pub key: String,
     pub base: String,
-    pub pair_label: String,
     pub exchange: String,
-    pub direction: Direction,
-    pub level: Level,
     pub price: Decimal,
     pub confirmed_at: DateTime<Utc>,
     pub sampled_at: Instant,
@@ -55,7 +31,6 @@ pub enum Delivery {
 #[derive(Debug)]
 pub struct DeliveryAck {
     pub key: String,
-    pub level: Level,
     pub delivery: Delivery,
 }
 
@@ -140,7 +115,6 @@ impl Telegram {
             let _ = ack
                 .send(DeliveryAck {
                     key: notification.key,
-                    level: notification.level,
                     delivery,
                 })
                 .await;
@@ -538,25 +512,17 @@ fn is_placeholder(value: &str) -> bool {
 }
 
 pub fn message(notification: &Notification) -> String {
-    let (title, signed_deviation, direction) = match (notification.level, notification.direction) {
-        (Level::Warning, Direction::Down) => ("⚠️", "–", "below"),
-        (Level::Warning, Direction::Up) => ("⚠️", "+", "above"),
-        (Level::Critical, Direction::Down) => ("🚨", "–", "below"),
-        (Level::Critical, Direction::Up) => ("🚨", "+", "above"),
-    };
-    let magnitude = ((notification.price - Decimal::ONE).abs() * Decimal::from(100)).round_dp(2);
-    let signed = format!("{signed_deviation}{magnitude:.2}%");
+    let magnitude = ((Decimal::ONE - notification.price) * Decimal::from(100)).round_dp(2);
+    let base = escape_html(&notification.base);
     format!(
-        "{title} <b>PRICE DEVIATION ALERT</b>\n<b>{}</b>\nPrice: <b>{:.4}</b>\nFair Price: <b>1.0000</b>\nDeviation: <b>{signed}</b>\n📍 {}\n⏱️ {}\n⚠️ {} is trading <b>{magnitude:.2}% {direction}</b> its estimated fair value.",
-        escape_html(&notification.pair_label),
+        "🚨 <b>PRICE DEVIATION ALERT</b>\n<b>{base} / USDT</b>\nPrice: <b>{:.4}</b>\nFair Price: <b>1.0000</b>\nDeviation: <b>–{magnitude:.2}%</b>\n📍 {}\n⏱️ {}\n⚠️ {base} is trading <b>{magnitude:.2}% below</b> its estimated fair value.",
         notification.price.round_dp(4),
         escape_html(&notification.exchange),
         notification.confirmed_at.format("%H:%M:%S UTC"),
-        escape_html(&notification.base),
     )
 }
 
-fn escape_html(value: &str) -> String {
+pub(crate) fn escape_html(value: &str) -> String {
     value
         .replace('&', "&amp;")
         .replace('<', "&lt;")
@@ -592,14 +558,11 @@ mod tests {
         thread,
     };
 
-    fn example(level: Level, direction: Direction, price: &str) -> Notification {
+    fn example(price: &str) -> Notification {
         Notification {
             key: "binance|USDe/USDT|down".into(),
             base: "USDe".into(),
-            pair_label: "USDe / USDT".into(),
             exchange: "Binance".into(),
-            direction,
-            level,
             price: price.parse().unwrap(),
             confirmed_at: Utc.with_ymd_and_hms(2025, 1, 2, 5, 3, 29).unwrap(),
             sampled_at: Instant::now(),
@@ -635,7 +598,7 @@ mod tests {
 
     #[test]
     fn screenshot_example_has_the_required_eight_lines() {
-        let rendered = message(&example(Level::Critical, Direction::Down, "0.9498"));
+        let rendered = message(&example("0.9498"));
         assert_eq!(
             rendered,
             "🚨 <b>PRICE DEVIATION ALERT</b>\n<b>USDe / USDT</b>\nPrice: <b>0.9498</b>\nFair Price: <b>1.0000</b>\nDeviation: <b>–5.02%</b>\n📍 Binance\n⏱️ 05:03:29 UTC\n⚠️ USDe is trading <b>5.02% below</b> its estimated fair value."
@@ -643,11 +606,11 @@ mod tests {
     }
 
     #[test]
-    fn upward_message_uses_plus_and_above() {
-        let rendered = message(&example(Level::Warning, Direction::Up, "1.0123"));
-        assert!(rendered.contains("⚠️ <b>PRICE DEVIATION ALERT</b>"));
-        assert!(rendered.contains("Deviation: <b>+1.23%</b>"));
-        assert!(rendered.ends_with("USDe is trading <b>1.23% above</b> its estimated fair value."));
+    fn downward_alert_uses_en_dash_and_below() {
+        let rendered = message(&example("0.994"));
+        assert!(rendered.contains("🚨 <b>PRICE DEVIATION ALERT</b>"));
+        assert!(rendered.contains("Deviation: <b>–0.60%</b>"));
+        assert!(rendered.ends_with("USDe is trading <b>0.60% below</b> its estimated fair value."));
     }
 
     #[test]
@@ -703,7 +666,7 @@ mod tests {
             token: "unused".into(),
             access_password: "test-secret".into(),
         };
-        let notification = example(Level::Warning, Direction::Down, "0.994");
+        let notification = example("0.994");
         let result = telegram
             .deliver_to_at(
                 &notification,
@@ -746,7 +709,7 @@ mod tests {
         };
         let result = telegram
             .deliver_at(
-                &example(Level::Warning, Direction::Down, "0.994"),
+                &example("0.994"),
                 Duration::from_secs(10),
                 &[123, 456],
                 &format!("http://{address}/sendMessage"),
@@ -765,11 +728,7 @@ mod tests {
         };
         assert!(matches!(
             telegram
-                .deliver(
-                    &example(Level::Warning, Direction::Down, "0.994"),
-                    Duration::from_secs(10),
-                    &[]
-                )
+                .deliver(&example("0.994"), Duration::from_secs(10), &[])
                 .await,
             Delivery::Stale
         ));

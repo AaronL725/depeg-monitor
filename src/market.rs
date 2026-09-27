@@ -13,13 +13,9 @@ use tokio::sync::mpsc;
 #[derive(Clone, Debug)]
 pub struct MarketInfo {
     pub symbol: String,
-    pub base: String,
     pub display_base: String,
-    pub quote: String,
-    pub pair_label: String,
 }
 
-#[derive(Clone)]
 pub struct BookUpdate {
     pub venue: String,
     pub market: MarketInfo,
@@ -86,17 +82,14 @@ fn market_info(markets: Vec<Market>, config: &Config) -> Vec<MarketInfo> {
                 || base == quote
                 || base == "USDT"
                 || !stablecoins.contains_key(&base)
-                || (quote != "USDT" && quote != "USDC")
+                || quote != "USDT"
             {
                 return None;
             }
             let display_base = stablecoins[&base].to_string();
             Some(MarketInfo {
                 symbol: market.symbol,
-                pair_label: format!("{display_base} / {quote}"),
                 display_base,
-                base,
-                quote,
             })
         })
         .collect()
@@ -325,13 +318,18 @@ pub async fn run_venue(venue: String, config: Config, tx: mpsc::Sender<FeedEvent
         tokio::time::Instant::now() + std::time::Duration::from_secs(config.market_refresh_seconds);
     loop {
         let next = tokio::select! {
-            result = AssertUnwindSafe(feed.next()).catch_unwind() => Some(result),
+            result = AssertUnwindSafe(feed.next()).catch_unwind() => Some(match result {
+                Ok(result) => result,
+                Err(payload) => Err(panic_reason(payload)),
+            }),
             _ = tokio::time::sleep_until(refresh_at) => None,
         };
         match next {
-            Some(Ok(Ok(book))) => {
+            Some(Ok(book)) => {
                 if !live {
-                    eprintln!("[market] {venue}: live L2 updates received");
+                    eprintln!(
+                        "[market] {venue}: first L2 update received after subscribe/reconnect"
+                    );
                     live = true;
                 }
                 match tx.try_send(FeedEvent::Book(book)) {
@@ -347,26 +345,12 @@ pub async fn run_venue(venue: String, config: Config, tx: mpsc::Sender<FeedEvent
                 }
                 backoff = 1;
             }
-            Some(Ok(Err(reason))) => {
+            Some(Err(reason)) => {
                 live = false;
                 let _ = tx
                     .send(FeedEvent::Offline {
                         venue: venue.clone(),
                         reason,
-                    })
-                    .await;
-                tokio::time::sleep(std::time::Duration::from_secs(backoff)).await;
-                backoff = (backoff * 2).min(60);
-                if let Err(error) = feed.reset_after_disconnect() {
-                    eprintln!("[market] {venue} subscription reset failed: {error}");
-                }
-            }
-            Some(Err(payload)) => {
-                live = false;
-                let _ = tx
-                    .send(FeedEvent::Offline {
-                        venue: venue.clone(),
-                        reason: panic_reason(payload),
                     })
                     .await;
                 tokio::time::sleep(std::time::Duration::from_secs(backoff)).await;
@@ -443,6 +427,7 @@ mod tests {
         let selected = market_info(
             vec![
                 market("USDC", "USDT", true, false, true),
+                market("USDe", "USDT", true, false, true),
                 market("USDe", "USDC", true, false, true),
                 market("USDT", "USDC", true, false, true),
                 market("USDe", "USDT", false, true, true),
@@ -456,7 +441,7 @@ mod tests {
                 .iter()
                 .map(|m| m.symbol.as_str())
                 .collect::<Vec<_>>(),
-            ["USDC/USDT", "USDe/USDC"]
+            ["USDC/USDT", "USDe/USDT"]
         );
     }
 
@@ -496,36 +481,11 @@ mod tests {
             ));
         }
         let markets = feed.markets();
-        let has_anchor = markets
+        let required: HashSet<_> = markets
             .iter()
-            .any(|market| market.base == "USDC" && market.quote == "USDT");
-        let has_usdc_quote = markets
-            .iter()
-            .any(|market| market.quote == "USDC" && market.base != "USDC");
-        let mut required = Vec::new();
-        if let Some(anchor) = markets
-            .iter()
-            .find(|market| market.base == "USDC" && market.quote == "USDT")
-        {
-            required.push(anchor.symbol.clone());
-        }
-        if let Some(quoted) = markets
-            .iter()
-            .find(|market| market.quote == "USDC" && market.base != "USDC")
-        {
-            if !required.contains(&quoted.symbol) {
-                required.push(quoted.symbol.clone());
-            }
-        }
-        for market in &markets {
-            if required.len() == 2 {
-                break;
-            }
-            if !required.contains(&market.symbol) {
-                required.push(market.symbol.clone());
-            }
-        }
-        let required: HashSet<_> = required.into_iter().collect();
+            .take(2)
+            .map(|market| market.symbol.clone())
+            .collect();
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(25);
         let mut seen = HashSet::new();
         while seen.len() < required.len() {
@@ -538,7 +498,7 @@ mod tests {
             }
         }
         Ok(format!(
-            "{venue}: {} markets, two L2 streams live, USDC/USDT anchor={has_anchor}, USDC quote={has_usdc_quote}",
+            "{venue}: {} USDT spot markets, two L2 streams live",
             feed.symbols.len()
         ))
     }

@@ -1,5 +1,5 @@
 use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
+use serde::{de::Error as _, Deserialize, Deserializer, Serialize};
 use std::{
     collections::{HashMap, HashSet},
     fs,
@@ -8,8 +8,28 @@ use std::{
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct IncidentState {
-    pub notified_level: u8,
+    #[serde(
+        default,
+        alias = "notified_level",
+        deserialize_with = "deserialize_notified"
+    )]
+    pub notified: bool,
     pub last_sent_at: Option<DateTime<Utc>>,
+}
+
+fn deserialize_notified<'de, D: Deserializer<'de>>(deserializer: D) -> Result<bool, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Value {
+        Bool(bool),
+        LegacyLevel(u8),
+    }
+
+    match Value::deserialize(deserializer)? {
+        Value::Bool(notified) => Ok(notified),
+        Value::LegacyLevel(level) if level <= 2 => Ok(level == 2),
+        Value::LegacyLevel(_) => Err(D::Error::custom("invalid legacy notification level")),
+    }
 }
 
 pub struct StateFile {
@@ -20,19 +40,14 @@ pub struct StateFile {
 impl StateFile {
     pub fn load(path: impl Into<PathBuf>) -> Result<Self, String> {
         let path = path.into();
-        let entries: HashMap<String, IncidentState> = match fs::read_to_string(&path) {
+        let mut entries: HashMap<String, IncidentState> = match fs::read_to_string(&path) {
             Ok(contents) => {
                 serde_json::from_str(&contents).map_err(|e| format!("{}: {e}", path.display()))?
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => HashMap::new(),
             Err(error) => return Err(format!("{}: {error}", path.display())),
         };
-        if let Some((key, _)) = entries.iter().find(|(_, state)| state.notified_level > 2) {
-            return Err(format!(
-                "{}: invalid notification level for {key}",
-                path.display()
-            ));
-        }
+        entries.retain(|_, state| state.notified);
         Ok(Self { path, entries })
     }
 
@@ -41,7 +56,7 @@ impl StateFile {
     }
 
     pub fn set(&mut self, key: String, state: IncidentState) -> Result<(), String> {
-        if state.notified_level == 0 {
+        if !state.notified {
             self.entries.remove(&key);
         } else {
             self.entries.insert(key, state);
@@ -57,10 +72,11 @@ impl StateFile {
         let venue_prefix = format!("{venue}|");
         let old_len = self.entries.len();
         self.entries.retain(|key, _| {
-            let Some((market_key, _)) = key.rsplit_once('|') else {
+            let Some((market_key, direction)) = key.rsplit_once('|') else {
                 return true;
             };
-            !market_key.starts_with(&venue_prefix) || active_market_keys.contains(market_key)
+            !market_key.starts_with(&venue_prefix)
+                || (direction == "down" && active_market_keys.contains(market_key))
         });
         if self.entries.len() == old_len {
             return Ok(());
@@ -139,40 +155,61 @@ mod tests {
     use super::*;
 
     #[test]
-    fn persisted_level_survives_reopen_and_recovery_removes_it() {
+    fn notification_state_survives_reopen_and_recovery_removes_it() {
         let path = std::env::temp_dir().join(format!("depeg-state-{}.json", std::process::id()));
         let mut state = StateFile::load(&path).unwrap();
         state
             .set(
                 "binance|USDe/USDT|down".into(),
                 IncidentState {
-                    notified_level: 2,
+                    notified: true,
                     last_sent_at: Some(Utc::now()),
                 },
             )
             .unwrap();
         let loaded = StateFile::load(&path).unwrap();
-        assert_eq!(loaded.get("binance|USDe/USDT|down").notified_level, 2);
+        assert!(loaded.get("binance|USDe/USDT|down").notified);
         let mut loaded = loaded;
         loaded
             .set("binance|USDe/USDT|down".into(), IncidentState::default())
             .unwrap();
-        assert_eq!(
-            StateFile::load(&path)
+        assert!(
+            !StateFile::load(&path)
                 .unwrap()
                 .get("binance|USDe/USDT|down")
-                .notified_level,
-            0
+                .notified
         );
         let _ = fs::remove_file(path);
     }
 
     #[test]
-    fn invalid_persisted_level_fails_loading_instead_of_suppressing_alerts() {
+    fn old_notification_state_migrates_and_invalid_level_fails_loading() {
         let path = std::env::temp_dir().join(format!(
             "depeg-state-{}-invalid-level.json",
             std::process::id()
         ));
+        fs::write(
+            &path,
+            r#"{"binance|USDe/USDT|down":{"notified_level":1,"last_sent_at":null}}"#,
+        )
+        .unwrap();
+        assert!(
+            !StateFile::load(&path)
+                .unwrap()
+                .get("binance|USDe/USDT|down")
+                .notified
+        );
+        fs::write(
+            &path,
+            r#"{"binance|USDe/USDT|down":{"notified_level":2,"last_sent_at":null}}"#,
+        )
+        .unwrap();
+        assert!(
+            StateFile::load(&path)
+                .unwrap()
+                .get("binance|USDe/USDT|down")
+                .notified
+        );
         fs::write(
             &path,
             r#"{"binance|USDe/USDT|down":{"notified_level":255,"last_sent_at":null}}"#,
@@ -216,7 +253,7 @@ mod tests {
                 .set(
                     key.into(),
                     IncidentState {
-                        notified_level: 1,
+                        notified: true,
                         last_sent_at: Some(Utc::now()),
                     },
                 )
@@ -226,9 +263,9 @@ mod tests {
             .retain_markets("binance", &["binance|USDC/USDT".into()].into())
             .unwrap();
         let state = StateFile::load(&path).unwrap();
-        assert_eq!(state.get("binance|USDe/USDT|down").notified_level, 0);
-        assert_eq!(state.get("binance|USDe/USDT|up").notified_level, 0);
-        assert_eq!(state.get("binance|USDC/USDT|down").notified_level, 1);
+        assert!(!state.get("binance|USDe/USDT|down").notified);
+        assert!(!state.get("binance|USDe/USDT|up").notified);
+        assert!(state.get("binance|USDC/USDT|down").notified);
         fs::remove_file(path).unwrap();
     }
 }

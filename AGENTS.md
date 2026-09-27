@@ -2,23 +2,25 @@
 
 ## 目标和边界
 
-使用 Rust 监控 Binance、OKX、Bitget、Bybit、Gate 的稳定币现货相对 1 USDT 的偏离，并通过 Telegram 发送截图样式的八行 HTML 告警。只包含行情、换算、确认、通知和必要状态记录；不添加交易执行、DEX、网页、数据库服务、历史盘口或流动性评分。
+使用 Rust 监控 Binance、OKX、Bitget、Bybit、Gate 的稳定币 USDT 现货相对 1 USDT 的向下偏离，并通过 Telegram 发送截图样式的八行 HTML 告警。只包含行情、判断、确认、通知和必要状态记录；不添加交易执行、DEX、网页、数据库服务、历史盘口或流动性评分。
 
 遵守 Ponytail full：简单函数、单一职责、复用现有库。不添加单实现 trait、工厂、插件系统、通用工具层或猜测未来需求的功能。必要的外部输入检查、错误处理及验证不能省略。
 
 ## 价格、状态和消息
 
-- 自动发现本机 `config.toml` 白名单中以 USDT/USDC 计价且可交易的现货；`config.toml` 由 `config.example.toml` 复制生成并已加入 `.gitignore`；排除合约、反向 USDT 市场和同币对。
-- 下偏使用买一且只在价格低于 1 USDT 时判定；上偏使用卖一且只在价格高于 1 USDT 时判定。USDC 计价价格乘以同所 USDC/USDT **卖一价**；不得改用买一、美元汇率或扣除手续费。USDC/USDT 同时接受监控。
-- 两档分别连续确认；达到第二档可直接首次发送第二档。首次、升级和定时提醒的成功发送才更新通知状态。方向、交易所和原交易对各自独立。
-- 失效或过期盘口暂停判断并清除未完成的确认计时，不视为价格恢复；通知状态保留。对应方向偏离严格低于恢复阈值并持续恢复时长后结束异常，不发送恢复通知；价格转到公允价另一侧时，该方向偏离视为零。
+- 自动发现本机 `config.toml` 白名单中以 USDT 计价且可交易的现货；`config.toml` 由 `config.example.toml` 复制生成并已加入 `.gitignore`；排除合约、反向 USDT 市场、以 USDC 为计价币的市场和同币对。
+- 只监控向下偏离，并使用 L2 卖一价（ask）判断，因为告警用于评估立即买入价格。卖一低于 1 USDT 至少 `depeg_bps` 时开始确认；公允价固定为 1 USDT。只处理 USDT 计价市场。
+- 达到配置中的脱锚阈值并连续确认后发送一次告警；之后按提醒间隔发送最新状态。Telegram 成功发送后才更新通知状态；每个交易所和原交易对独立。
+- 失效或超过 `max_quote_age_seconds` 未更新的盘口暂停判断并清除未完成确认计时，不视为价格恢复；通知状态保留。交易所断连时清除该所全部缓存盘口，重连后每个市场都必须收到新盘口才重新参与判断。
+- `/status` 显示每家交易所的逐市场盘口年龄或等待、失效、无更新状态。无更新表示本机超过 `max_quote_age_seconds` 未收到该市场订单簿消息，不代表能单独确认 WebSocket 断开；该盘口仍暂停告警。`first L2 update received` 只说明连接后收到首个订单簿消息，不是持续健康证明；无更新与恢复日志按市场状态变化记录。
+- 向下偏离严格低于恢复阈值并持续恢复时长后结束异常，不发送恢复通知；卖一回到公允价或其上方时，向下偏离视为零。
 - 阈值与时间默认值以 `config.toml` 为准；只有用户确认的规则变更才能修改行为约定。
-- Telegram 固定八行：标题、交易对、Price、Fair Price、Deviation、交易所、UTC 时间、英文说明。第一档标题 ⚠️，第二档 🚨；下偏用 en dash（–）和 below，上偏用 + 和 above；价格四位、百分比两位，只在显示时舍入。
-- USDC 计价显示 `USDe / USDC → USDT`。数字、交易对和标题加粗；末行仅“百分比 below/above”加粗。不加按钮、空行或额外字段。
+- Telegram 固定八行：标题、交易对、Price、Fair Price、Deviation、交易所、UTC 时间、英文说明。标题使用 🚨；下偏用 en dash（–）和 below；价格四位、百分比两位，只在显示时舍入。
+- 数字、交易对和标题加粗；末行仅“百分比 below”加粗。不加按钮、空行或额外字段。
 
 ## 结构和实现
 
-单 Cargo 项目、单可执行程序。`config` 读取配置；`market` 负责发现、订阅和校验行情；`engine` 负责换算、计时和告警状态；`alert` 负责模板与 Telegram；`state` 保存通知状态；`main` 组装任务及关闭处理。共享类型只有真实复用时才抽出。
+单 Cargo 项目、单可执行程序。`config` 读取配置；`market` 负责发现、订阅和校验行情；`engine` 负责卖一价格判断、计时和告警状态；`alert` 负责模板与 Telegram；`state` 保存通知状态；`main` 组装任务及关闭处理。共享类型只有真实复用时才抽出。
 
 固定使用 `ccxt-pro` / `ccxt-base` 4.5.84，只启用 Binance、OKX、Bitget、Bybit、Gate feature。Gate 由单个 `GateCore` 管理全部市场订阅，复用 CCXT 的公开 `subscribe_public_multiple`；不要为 Gate 每个市场创建独立客户端，因为 CCXT 的进程级 WebSocket 注册表按 URL 共享连接，各实例的盘口状态会丢增量。
 

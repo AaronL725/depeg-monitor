@@ -6,8 +6,7 @@ use std::{fs, path::Path};
 pub struct Config {
     pub exchanges: Vec<String>,
     pub stablecoins: Vec<String>,
-    pub warning_bps: i64,
-    pub critical_bps: i64,
+    pub depeg_bps: i64,
     pub confirmation_seconds: u64,
     pub reminder_seconds: u64,
     pub recovery_bps: i64,
@@ -47,8 +46,7 @@ impl Default for Config {
             stablecoins: ["USDC", "USDe", "DAI", "FDUSD", "PYUSD"]
                 .map(str::to_owned)
                 .into(),
-            warning_bps: 50,
-            critical_bps: 100,
+            depeg_bps: 100,
             confirmation_seconds: 5,
             reminder_seconds: 1800,
             recovery_bps: 40,
@@ -67,11 +65,11 @@ impl Config {
     pub fn load(path: &Path) -> Result<Self, String> {
         let raw = fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
         let config: Self = toml::from_str(&raw).map_err(|e| e.to_string())?;
-        if config.warning_bps <= 0 || config.critical_bps < config.warning_bps {
-            return Err("thresholds must satisfy 0 < warning_bps <= critical_bps".into());
+        if config.depeg_bps <= 0 {
+            return Err("depeg_bps must be positive".into());
         }
-        if config.recovery_bps <= 0 || config.recovery_bps >= config.warning_bps {
-            return Err("recovery_bps must satisfy 0 < recovery_bps < warning_bps".into());
+        if config.recovery_bps <= 0 || config.recovery_bps >= config.depeg_bps {
+            return Err("recovery_bps must satisfy 0 < recovery_bps < depeg_bps".into());
         }
         if config.confirmation_seconds == 0
             || config.reminder_seconds == 0
@@ -105,7 +103,7 @@ mod tests {
     #[test]
     fn defaults_match_the_confirmed_thresholds() {
         let config = Config::default();
-        assert_eq!((config.warning_bps, config.critical_bps), (50, 100));
+        assert_eq!(config.depeg_bps, 100);
         assert_eq!(
             (config.confirmation_seconds, config.reminder_seconds),
             (5, 1800)

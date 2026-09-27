@@ -2,8 +2,7 @@
 # Fair price is fixed at 1 USDT; 1 bp = 0.01%.
 exchanges = ["binance", "okx", "bitget", "bybit", "gate"]
 stablecoins = ["USDC", "USDe", "DAI", "FDUSD", "PYUSD"]
-warning_bps = 50
-critical_bps = 100
+depeg_bps = 100
 confirmation_seconds = 5
 reminder_seconds = 1800
 recovery_bps = 40

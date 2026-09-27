@@ -4,16 +4,16 @@ Rust 常驻程序，通过固定版本的 CCXT Rust `ccxt-pro` 读取 Binance、
 
 ## 行为
 
-- 自动发现 `config.toml` 白名单中以 USDT、USDC 计价的活跃现货市场；排除合约、反向 USDT 市场和同币对。
-- 下偏使用买一，上偏使用卖一。USDC 计价价格乘以同所 USDC/USDT 卖一价；公允价固定为 1 USDT。
-- 两档分别连续确认 5 秒。满足第二档时可直接发送第二档；升档立即通知。异常每 30 分钟发送一次最新状态；对应方向偏离严格低于 0.4% 并持续 30 秒后结束异常，不发恢复消息。
-- 盘口无效或超过 15 秒未更新时暂停判断并清除未完成计时。重连后重新确认，已发送等级保留。
-- Telegram 固定八行 HTML，按截图格式发送。第一档标题 ⚠️、第二档 🚨；USDC 交易对显示 `USDe / USDC → USDT`。
-- 用户私聊 bot 发送 `/start` 并输入访问密码后，该聊天会持久授权并接收告警；`/stop` 取消授权。只有授权的私聊可以使用 `/status`。程序只监听私聊，避免把密码放进群聊。`getUpdates` 长轮询要求 bot 不配置 webhook。
+- 自动发现 `config.toml` 白名单中以 USDT 计价的活跃现货市场；排除以 USDC 为计价币的市场、合约、反向 USDT 市场和同币对。
+- 只监控向下偏离，使用 L2 卖一价（ask）判断。卖一低于固定公允价 1 USDT 达到 `depeg_bps`（默认 100 bp，即 1%）时开始确认；以 USDC 为计价币的市场不参与监控。
+- 偏离连续确认 5 秒后发送告警；异常每 30 分钟发送一次最新状态；偏离严格低于 0.4% 并持续 30 秒后结束异常，不发恢复消息。
+- 盘口无效或超过 15 秒未更新时暂停判断并清除未完成计时。无更新只说明本机没有收到该市场的新订单簿消息，不等同于交易所 WebSocket 已断开。交易所断连后会清掉该所缓存盘口，重连时各交易对收到新盘口后才恢复判断；已发送告警状态保留。
+- Telegram 固定八行 HTML，按截图格式发送；标题使用 🚨，下偏使用 en dash 和 `below`。
+- 用户私聊 bot 发送 `/start` 并输入访问密码后，该聊天会持久授权并接收告警；`/stop` 取消授权。只有授权的私聊可以使用 `/status`。状态会逐市场显示最近盘口年龄、无更新时间、失效或等待盘口。程序只监听私聊，避免把密码放进群聊。`getUpdates` 长轮询要求 bot 不配置 webhook。
 - 授权聊天保存在 `telegram.authorized_chats_path`。本机 `config.toml` 包含 Bot Token 和访问密码，已加入 `.gitignore`；提交和分享时只使用占位符模板 `config.example.toml`。Bot ID 已由 token 标识，无需另行配置。
 - 告警会发送到所有已授权私聊。若部分发送遇到短暂错误，可能重试整个事件，已收到的聊天有机会看到重复告警。
 
-可调阈值、Telegram token 和访问密码都在本机 `config.toml`。该文件已加入 `.gitignore`；从 [config.example.toml](/Users/aaronliang/Documents/Projects/depeg-monitor/config.example.toml) 复制后，用你自己的值替换尖括号占位符。状态保存在 `state_path` 指定的 JSON 文件，不保存盘口历史。没有订单执行、DEX、网页或数据库。
+可调阈值、Telegram token 和访问密码都在本机 `config.toml`。该文件已加入 `.gitignore`；从 `config.example.toml` 复制后，用你自己的值替换尖括号占位符。状态保存在 `state_path` 指定的 JSON 文件，不保存盘口历史。没有订单执行、DEX、网页或数据库。
 
 ## 日志和磁盘
 
