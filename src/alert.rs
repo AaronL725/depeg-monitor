@@ -1,4 +1,9 @@
-use crate::{config::TelegramConfig, state::AuthorizedChats};
+mod commands;
+
+use crate::{
+    config::{MonitorSettings, TelegramConfig},
+    state::{save_monitor_settings, AuthorizedChats},
+};
 use chrono::{DateTime, Utc};
 use futures_util::StreamExt;
 use reqwest::{Client, StatusCode};
@@ -6,6 +11,7 @@ use rust_decimal::Decimal;
 use serde_json::json;
 use std::{
     collections::HashMap,
+    path::{Path, PathBuf},
     time::{Duration, Instant},
 };
 use tokio::sync::{mpsc, watch};
@@ -126,6 +132,9 @@ impl Telegram {
         status: watch::Receiver<String>,
         authorized_tx: watch::Sender<Vec<i64>>,
         mut authorized: AuthorizedChats,
+        mut monitor_settings: MonitorSettings,
+        monitor_settings_path: PathBuf,
+        monitor_settings_tx: watch::Sender<MonitorSettings>,
     ) {
         let url = format!("https://api.telegram.org/bot{}/getUpdates", self.token);
         let mut offset = None;
@@ -204,11 +213,11 @@ impl Telegram {
                     continue;
                 };
 
-                if is_start_command(text) {
+                if commands::is_command(text, "/start") {
                     if authorized.contains(chat_id) {
                         self.send_reply(
                             chat_id,
-                            "✅ 已授权，可以使用 /status；发送 /stop 可取消接收告警。",
+                            "✅ 已授权，可以使用 /status 和 /help；发送 /stop 可取消接收告警。",
                         )
                         .await;
                     } else {
@@ -226,7 +235,7 @@ impl Telegram {
                     continue;
                 }
 
-                if is_stop_command(text) {
+                if commands::is_command(text, "/stop") {
                     pending.remove(&chat_id);
                     failed_attempts.remove(&chat_id);
                     match authorized.remove(chat_id) {
@@ -244,7 +253,7 @@ impl Telegram {
                     continue;
                 }
 
-                if is_status_command(text) {
+                if commands::is_command(text, "/status") {
                     if authorized.contains(chat_id) {
                         let text = status.borrow().clone();
                         self.send_status(chat_id, &text).await;
@@ -253,6 +262,91 @@ impl Telegram {
                             .await;
                     }
                     continue;
+                }
+
+                if authorized.contains(chat_id) {
+                    if commands::is_command(text, "/help") {
+                        self.send_reply(chat_id, commands::monitor_help()).await;
+                        continue;
+                    }
+                    if commands::is_command(text, "/exchanges") {
+                        self.send_reply(chat_id, &commands::exchange_list(&monitor_settings))
+                            .await;
+                        continue;
+                    }
+                    if commands::is_command(text, "/coins") {
+                        self.send_reply(
+                            chat_id,
+                            &format!(
+                                "当前监控代币：{}\n使用 /coin <代币> on|off 选择；使用 /addcoin <代币> 添加。",
+                                monitor_settings.stablecoins.join(", ")
+                            ),
+                        )
+                        .await;
+                        continue;
+                    }
+                    if let Some(args) = commands::command_args(text, "/exchange") {
+                        let [exchange, action] = args.as_slice() else {
+                            self.send_reply(chat_id, "用法：/exchange <交易所> on|off")
+                                .await;
+                            continue;
+                        };
+                        let mut updated = monitor_settings.clone();
+                        if let Err(error) = commands::set_exchange(&mut updated, exchange, action) {
+                            self.send_reply(chat_id, error).await;
+                            continue;
+                        }
+                        self.persist_monitor_settings(
+                            chat_id,
+                            updated,
+                            &mut monitor_settings,
+                            &monitor_settings_path,
+                            &monitor_settings_tx,
+                        )
+                        .await;
+                        continue;
+                    }
+                    if let Some(args) = commands::command_args(text, "/addcoin") {
+                        let [coin] = args.as_slice() else {
+                            self.send_reply(chat_id, "用法：/addcoin <代币符号>").await;
+                            continue;
+                        };
+                        let mut updated = monitor_settings.clone();
+                        if let Err(error) = commands::add_monitor_coin(&mut updated, coin) {
+                            self.send_reply(chat_id, error).await;
+                            continue;
+                        }
+                        self.persist_monitor_settings(
+                            chat_id,
+                            updated,
+                            &mut monitor_settings,
+                            &monitor_settings_path,
+                            &monitor_settings_tx,
+                        )
+                        .await;
+                        continue;
+                    }
+                    if let Some(args) = commands::command_args(text, "/coin") {
+                        let [coin, action] = args.as_slice() else {
+                            self.send_reply(chat_id, "用法：/coin <代币符号> on|off")
+                                .await;
+                            continue;
+                        };
+                        let mut updated = monitor_settings.clone();
+                        if let Err(error) = commands::set_monitor_coin(&mut updated, coin, action) {
+                            self.send_reply(chat_id, error).await;
+                            continue;
+                        }
+                        self.persist_monitor_settings(
+                            chat_id,
+                            updated,
+                            &mut monitor_settings,
+                            &monitor_settings_path,
+                            &monitor_settings_tx,
+                        )
+                        .await;
+                        continue;
+                    }
                 }
 
                 if !pending.contains_key(&chat_id) {
@@ -271,7 +365,7 @@ impl Telegram {
                     match authorized.add(chat_id) {
                         Ok(()) => {
                             authorized_tx.send_replace(authorized.ids());
-                            self.send_reply(chat_id, "✅ 密码正确，已启用监控告警。发送 /status 查看状态，/stop 可取消。")
+                            self.send_reply(chat_id, "✅ 密码正确，已启用监控告警。发送 /status 查看状态，/help 查看控制命令，/stop 可取消。")
                                 .await;
                         }
                         Err(error) => {
@@ -291,6 +385,33 @@ impl Telegram {
                             .await;
                     }
                 }
+            }
+        }
+    }
+
+    async fn persist_monitor_settings(
+        &self,
+        chat_id: i64,
+        updated: MonitorSettings,
+        current: &mut MonitorSettings,
+        path: &Path,
+        sender: &watch::Sender<MonitorSettings>,
+    ) {
+        if *current == updated {
+            self.send_reply(chat_id, "设置没有变化。").await;
+            return;
+        }
+        match save_monitor_settings(path, &updated) {
+            Ok(()) => {
+                *current = updated.clone();
+                sender.send_replace(updated);
+                self.send_reply(chat_id, "设置已保存，所有启用的行情源正在重新同步。")
+                    .await;
+            }
+            Err(error) => {
+                eprintln!("[telegram] monitor settings save failed: {error}");
+                self.send_reply(chat_id, "保存设置失败，当前监控配置未改变。")
+                    .await;
             }
         }
     }
@@ -321,11 +442,11 @@ impl Telegram {
                     .await
                     .is_ok_and(|body| body["ok"] == true)
                 {
-                    eprintln!("[telegram] /status reply rejected");
+                    eprintln!("[telegram] interactive reply rejected");
                 }
             }
-            Ok(response) => eprintln!("[telegram] /status reply HTTP {}", response.status()),
-            Err(_) => eprintln!("[telegram] /status reply failed"),
+            Ok(response) => eprintln!("[telegram] interactive reply HTTP {}", response.status()),
+            Err(_) => eprintln!("[telegram] interactive reply failed"),
         }
     }
 
@@ -529,25 +650,6 @@ pub(crate) fn escape_html(value: &str) -> String {
         .replace('>', "&gt;")
 }
 
-fn is_start_command(text: &str) -> bool {
-    is_command(text, "/start")
-}
-
-fn is_stop_command(text: &str) -> bool {
-    is_command(text, "/stop")
-}
-
-fn is_status_command(text: &str) -> bool {
-    is_command(text, "/status")
-}
-
-fn is_command(text: &str, expected: &str) -> bool {
-    text.split_whitespace()
-        .next()
-        .and_then(|command| command.split('@').next())
-        == Some(expected)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -611,16 +713,6 @@ mod tests {
         assert!(rendered.contains("🚨 <b>PRICE DEVIATION ALERT</b>"));
         assert!(rendered.contains("Deviation: <b>–0.60%</b>"));
         assert!(rendered.ends_with("USDe is trading <b>0.60% below</b> its estimated fair value."));
-    }
-
-    #[test]
-    fn status_command_matches_private_and_bot_addressed_forms() {
-        assert!(is_status_command("/status"));
-        assert!(is_status_command("/status@DepegBot"));
-        assert!(is_start_command("/start@DepegBot"));
-        assert!(is_stop_command("/stop"));
-        assert!(!is_status_command("/start"));
-        assert!(!is_status_command("status"));
     }
 
     #[test]

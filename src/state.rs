@@ -1,3 +1,4 @@
+use crate::config::MonitorSettings;
 use chrono::{DateTime, Utc};
 use serde::{de::Error as _, Deserialize, Deserializer, Serialize};
 use std::{
@@ -35,6 +36,23 @@ fn deserialize_notified<'de, D: Deserializer<'de>>(deserializer: D) -> Result<bo
 pub struct StateFile {
     path: PathBuf,
     entries: HashMap<String, IncidentState>,
+}
+
+pub fn load_monitor_settings(
+    path: &Path,
+    defaults: MonitorSettings,
+) -> Result<MonitorSettings, String> {
+    match fs::read_to_string(path) {
+        Ok(contents) => {
+            serde_json::from_str(&contents).map_err(|e| format!("{}: {e}", path.display()))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(defaults),
+        Err(error) => Err(format!("{}: {error}", path.display())),
+    }
+}
+
+pub fn save_monitor_settings(path: &Path, settings: &MonitorSettings) -> Result<(), String> {
+    save_json(path, settings)
 }
 
 impl StateFile {
@@ -180,6 +198,26 @@ mod tests {
                 .notified
         );
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn monitor_settings_load_defaults_then_persist_changes() {
+        let path = std::env::temp_dir().join(format!("depeg-settings-{}.json", std::process::id()));
+        let defaults = MonitorSettings {
+            exchanges: vec!["binance".into()],
+            stablecoins: vec!["USDe".into()],
+        };
+        assert_eq!(
+            load_monitor_settings(&path, defaults.clone()).unwrap(),
+            defaults
+        );
+        let selected = MonitorSettings {
+            exchanges: vec!["binance".into(), "gate".into()],
+            stablecoins: vec!["USDe".into(), "DAI".into()],
+        };
+        save_monitor_settings(&path, &selected).unwrap();
+        assert_eq!(load_monitor_settings(&path, defaults).unwrap(), selected);
+        fs::remove_file(path).unwrap();
     }
 
     #[test]

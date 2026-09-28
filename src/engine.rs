@@ -1,6 +1,6 @@
 use crate::{
     alert::{escape_html, Delivery, DeliveryAck, Notification},
-    config::Config,
+    config::{Config, MonitorSettings},
     market::{BookUpdate, FeedEvent, MarketInfo},
     state::{IncidentState, StateFile},
 };
@@ -94,6 +94,7 @@ impl Engine {
             tokio::select! {
                 _ = &mut shutdown => return,
                 event = feeds.recv() => match event {
+                    Some(FeedEvent::Settings(settings)) => self.apply_monitor_settings(settings),
                     Some(FeedEvent::Markets { venue, markets }) => self.set_markets(&venue, markets),
                     Some(FeedEvent::Book(book)) => self.update_book(book),
                     Some(FeedEvent::Offline { venue, reason }) => {
@@ -186,6 +187,9 @@ impl Engine {
 
     fn set_markets(&mut self, venue: &str, markets: Vec<MarketInfo>) {
         self.catalogued.insert(venue.into());
+        if markets.is_empty() {
+            self.offline.remove(venue);
+        }
         let count = markets.len();
         let symbols = markets
             .iter()
@@ -218,6 +222,40 @@ impl Engine {
                 .insert(market_key(venue, &market.symbol), market);
         }
         eprintln!("[market] {venue}: {count} stablecoin spot markets: {symbols}");
+    }
+
+    fn apply_monitor_settings(&mut self, settings: MonitorSettings) {
+        let mut venues: HashSet<_> = self.config.exchanges.iter().cloned().collect();
+        venues.extend(settings.exchanges.iter().cloned());
+        self.config.exchanges = settings.exchanges;
+        self.config.stablecoins = settings.stablecoins;
+
+        for venue in venues {
+            let prefix = format!("{venue}|");
+            let markets = if self.config.exchanges.contains(&venue) {
+                self.markets
+                    .iter()
+                    .filter(|(key, market)| {
+                        key.starts_with(&prefix)
+                            && self
+                                .config
+                                .stablecoins
+                                .iter()
+                                .any(|coin| coin.eq_ignore_ascii_case(&market.display_base))
+                    })
+                    .map(|(_, market)| market.clone())
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            self.set_markets(&venue, markets);
+            if self.config.exchanges.contains(&venue) {
+                self.offline.insert(venue.clone());
+                self.pause_venue(&venue);
+            } else {
+                self.offline.remove(&venue);
+            }
+        }
     }
 
     fn pause_venue(&mut self, venue: &str) {
@@ -510,7 +548,7 @@ mod tests {
 
     fn market() -> MarketInfo {
         MarketInfo {
-            symbol: "USDe/USDT".into(),
+            symbol: "USDE/USDT".into(),
             display_base: "USDe".into(),
         }
     }
@@ -531,7 +569,7 @@ mod tests {
     ) {
         let at = start + Duration::from_secs(sec);
         engine.evaluate_depeg(
-            "binance|USDe/USDT",
+            "binance|USDE/USDT",
             market,
             "binance",
             price.parse().unwrap(),
@@ -544,8 +582,8 @@ mod tests {
 
     #[test]
     fn event_keys_are_scoped_to_market_and_venue() {
-        assert_eq!(event_key("binance|USDe/USDT"), "binance|USDe/USDT|down");
-        assert_ne!(event_key("binance|USDe/USDT"), event_key("okx|USDe/USDT"));
+        assert_eq!(event_key("binance|USDE/USDT"), "binance|USDE/USDT|down");
+        assert_ne!(event_key("binance|USDE/USDT"), event_key("okx|USDE/USDT"));
     }
 
     #[test]
@@ -625,11 +663,40 @@ mod tests {
             quote: Ok(("0.999".parse().unwrap(), "1.001".parse().unwrap())),
             received_at: Instant::now(),
         });
-        assert!(!engine.stale.contains("binance|USDe/USDT"));
+        assert!(!engine.stale.contains("binance|USDE/USDT"));
         assert!(engine.stale.contains("binance|DAI/USDT"));
         let status = engine.status_text();
         assert!(status.contains("partial <b>Binance</b> — 1/2 L2 fresh"));
         assert!(status.contains("DAI / USDT: waiting for L2"));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn monitor_settings_remove_disabled_venues_and_unselected_coins() {
+        let (mut engine, _queue, path) = engine("settings-change");
+        let stable = market();
+        let dai = dai_market();
+        engine.set_markets("binance", vec![stable.clone(), dai]);
+        engine.set_markets("okx", vec![stable.clone()]);
+
+        engine.apply_monitor_settings(MonitorSettings {
+            exchanges: vec!["binance".into()],
+            stablecoins: vec!["USDe".into()],
+        });
+
+        assert_eq!(engine.config.exchanges, ["binance"]);
+        assert_eq!(engine.config.stablecoins, ["USDe"]);
+        assert_eq!(engine.markets.len(), 1);
+        assert!(engine.markets.contains_key("binance|USDE/USDT"));
+        assert!(engine.books.is_empty());
+        assert!(engine.offline.contains("binance"));
+        let disabled_alert = event_key("okx|USDE/USDT");
+        engine.delivery_ack(DeliveryAck {
+            key: disabled_alert.clone(),
+            delivery: Delivery::Sent(Utc::now()),
+        });
+        assert!(!engine.incidents.contains_key(&disabled_alert));
+        assert!(!engine.state.get(&disabled_alert).notified);
         let _ = fs::remove_file(path);
     }
 
@@ -735,7 +802,7 @@ mod tests {
     fn decimal_overflow_pauses_confirmation_without_panicking() {
         let (mut engine, mut queue, path) = engine("decimal-overflow");
         let start = Instant::now();
-        let key = event_key("binance|USDe/USDT");
+        let key = event_key("binance|USDE/USDT");
         engine.incidents.insert(
             key.clone(),
             Incident {
@@ -744,7 +811,7 @@ mod tests {
             },
         );
         engine.evaluate_depeg(
-            "binance|USDe/USDT",
+            "binance|USDE/USDT",
             &market(),
             "binance",
             Decimal::MAX,
@@ -767,7 +834,7 @@ mod tests {
             for sec in [0, 5] {
                 let at = start + Duration::from_secs(sec);
                 engine.evaluate_depeg(
-                    &format!("binance|USDe/USDT|{source}"),
+                    &format!("binance|USDE/USDT|{source}"),
                     &market,
                     "binance",
                     "0.989".parse().unwrap(),
@@ -779,7 +846,7 @@ mod tests {
             }
         }
         let first = queue.try_recv().unwrap();
-        let second_source = "binance|USDe/USDT|second";
+        let second_source = "binance|USDE/USDT|second";
         let second_key = event_key(second_source);
         assert!(!engine.incidents[&second_key].pending);
         engine.evaluate_depeg(
@@ -824,7 +891,7 @@ mod tests {
         let path =
             std::env::temp_dir().join(format!("depeg-engine-{}-reminder.json", std::process::id()));
         let _ = fs::remove_file(&path);
-        let key = event_key("binance|USDe/USDT");
+        let key = event_key("binance|USDE/USDT");
         let mut state = StateFile::load(&path).unwrap();
         state
             .set(
@@ -861,7 +928,7 @@ mod tests {
     fn recovery_requires_thirty_seconds_strictly_below_four_bps() {
         let (mut engine, _queue, path) = engine("recovery");
         let market = market();
-        let key = event_key("binance|USDe/USDT");
+        let key = event_key("binance|USDE/USDT");
         engine.delivery_ack(DeliveryAck {
             key: key.clone(),
             delivery: Delivery::Sent(Utc::now()),
@@ -916,7 +983,7 @@ mod tests {
             status,
             authorized_receiver,
         );
-        let key = event_key("binance|USDe/USDT");
+        let key = event_key("binance|USDE/USDT");
         engine.delivery_ack(DeliveryAck {
             key: key.clone(),
             delivery: Delivery::Sent(Utc::now()),

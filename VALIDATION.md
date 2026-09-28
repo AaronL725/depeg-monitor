@@ -2,11 +2,13 @@
 
 ## 最新代码变更
 
-2026-09-28 完成 Ponytail full 全仓检查：合并重复的行情错误路径，删除可由盘口状态推导的重复在线标记，并从白名单币种生成 USDT 交易对标签。前一项修改已将规则收敛到 USDT 现货、向下卖一告警，并加入逐市场状态及断线后盘口清理。
+2026-09-28 全仓检查：将 Telegram 监控命令拆到 `alert::commands`，复用代币校验，简化行情任务重启；修复关闭交易所后延迟通知回执可能恢复已清除状态的问题。此前已按大小写不敏感的规范化交易对去重、保留原始 symbol 订阅，并实现全局监控设置持久化及运行时重启。
 
 - `cargo fmt --all -- --check`：通过。
-- `cargo test --locked --offline -j 1`：35 项通过、0 失败、2 项联网 smoke 忽略。
+- `cargo test --locked --offline -j 1`：39 项通过、0 失败、2 项联网 smoke 忽略。
 - 回归覆盖逐市场盘口年龄、无更新状态和断线后逐市场重新同步。
+- 回归覆盖大小写别名去重、监控设置持久化与运行时应用。
+- 回归覆盖关闭交易所后延迟到达的通知回执不会重建告警状态。
 - `cargo clippy --locked --offline --all-targets -j 1 -- -D warnings`：通过。
 - `cargo build --release --locked --offline -j 1`：通过。
 - 未重新运行五家交易所实时 smoke、Telegram 端到端验证或 48 小时部署观察。

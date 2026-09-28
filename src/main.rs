@@ -6,9 +6,9 @@ mod state;
 
 use crate::{
     alert::Telegram,
-    config::Config,
+    config::{Config, MonitorSettings, MONITOR_SETTINGS_PATH},
     engine::Engine,
-    state::{AuthorizedChats, StateFile},
+    state::{load_monitor_settings, AuthorizedChats, StateFile},
 };
 use std::collections::HashSet;
 use std::{env, path::PathBuf, time::Duration};
@@ -30,7 +30,20 @@ async fn run() -> Result<(), String> {
         .map(PathBuf::from)
         .or_else(|| env::var_os("DEPEG_CONFIG").map(PathBuf::from))
         .unwrap_or_else(|| PathBuf::from("config.toml"));
-    let config = Config::load(&config_path)?;
+    let mut config = Config::load(&config_path)?;
+    let monitor_settings_path = PathBuf::from(MONITOR_SETTINGS_PATH);
+    let monitor_settings = load_monitor_settings(
+        &monitor_settings_path,
+        MonitorSettings {
+            exchanges: config.exchanges.clone(),
+            stablecoins: config.stablecoins.clone(),
+        },
+    )?;
+    if monitor_settings.exchanges.is_empty() || monitor_settings.stablecoins.is_empty() {
+        return Err("monitor settings must include at least one exchange and one coin".into());
+    }
+    config.exchanges = monitor_settings.exchanges.clone();
+    config.stablecoins = monitor_settings.stablecoins.clone();
     if config.exchanges.iter().collect::<HashSet<_>>().len() != config.exchanges.len() {
         return Err("exchange ids must be unique; duplicate clients share websocket state".into());
     }
@@ -47,21 +60,27 @@ async fn run() -> Result<(), String> {
     let (ack_tx, ack_rx) = mpsc::channel(config.notification_queue_capacity);
     let (status_tx, status_rx) = watch::channel(String::new());
     let (authorized_tx, authorized_rx) = watch::channel(authorized.ids());
+    let (monitor_settings_tx, monitor_settings_rx) = watch::channel(monitor_settings.clone());
 
-    tokio::spawn(
-        telegram
-            .clone()
-            .run_status(status_rx, authorized_tx, authorized),
-    );
+    tokio::spawn(telegram.clone().run_status(
+        status_rx,
+        authorized_tx,
+        authorized,
+        monitor_settings,
+        monitor_settings_path,
+        monitor_settings_tx,
+    ));
     tokio::spawn(telegram.run(
         notifications_rx,
         ack_tx,
         Duration::from_secs(config.max_quote_age_seconds),
         authorized_rx.clone(),
     ));
-    for venue in config.exchanges.iter().cloned() {
-        tokio::spawn(market::run_venue(venue, config.clone(), feeds_tx.clone()));
-    }
+    tokio::spawn(run_market_tasks(
+        config.clone(),
+        monitor_settings_rx,
+        feeds_tx.clone(),
+    ));
     drop(feeds_tx);
 
     #[cfg(unix)]
@@ -86,4 +105,44 @@ async fn run() -> Result<(), String> {
         .run(feeds_rx, ack_rx, shutdown)
         .await;
     Ok(())
+}
+
+async fn run_market_tasks(
+    config: Config,
+    mut settings: watch::Receiver<MonitorSettings>,
+    feeds: mpsc::Sender<market::FeedEvent>,
+) {
+    let mut tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+    let mut current = settings.borrow_and_update().clone();
+    loop {
+        let mut feed_config = config.clone();
+        feed_config.exchanges = current.exchanges.clone();
+        feed_config.stablecoins = current.stablecoins.clone();
+        for venue in current.exchanges.iter().cloned() {
+            tasks.push(tokio::spawn(market::run_venue(
+                venue,
+                feed_config.clone(),
+                feeds.clone(),
+            )));
+        }
+        if settings.changed().await.is_err() {
+            break;
+        }
+        for task in tasks.drain(..) {
+            task.abort();
+            let _ = task.await;
+        }
+        current = settings.borrow_and_update().clone();
+        if feeds
+            .send(market::FeedEvent::Settings(current.clone()))
+            .await
+            .is_err()
+        {
+            break;
+        }
+    }
+    for task in tasks {
+        task.abort();
+        let _ = task.await;
+    }
 }

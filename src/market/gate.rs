@@ -12,6 +12,15 @@ pub struct GateFeed {
     subscribed: HashSet<String>,
 }
 
+impl Drop for GateFeed {
+    fn drop(&mut self) {
+        if let Value::Str(url) = &self.url {
+            // CCXT keeps websocket clients in a process-wide registry.
+            ccxt_base::pro::ws_client::drop_client(url);
+        }
+    }
+}
+
 impl GateFeed {
     pub async fn load_markets() -> Result<(GateCore, Vec<ccxt_pro::types::Market>), String> {
         let mut core = GateCore::new(Some(Value::from_json(&serde_json::json!({

@@ -1,13 +1,19 @@
 mod gate;
 
-use crate::config::Config;
+use crate::config::{Config, MonitorSettings, SUPPORTED_EXCHANGES};
 use ccxt_pro::{
     types::{Market, OrderBook},
     Binance, Bitget, Bybit, Okx, Params,
 };
 use futures_util::FutureExt;
 use rust_decimal::Decimal;
-use std::{any::Any, collections::HashMap, panic::AssertUnwindSafe, str::FromStr, time::Instant};
+use std::{
+    any::Any,
+    collections::{HashMap, HashSet},
+    panic::AssertUnwindSafe,
+    str::FromStr,
+    time::Instant,
+};
 use tokio::sync::mpsc;
 
 #[derive(Clone, Debug)]
@@ -24,6 +30,7 @@ pub struct BookUpdate {
 }
 
 pub enum FeedEvent {
+    Settings(MonitorSettings),
     Markets {
         venue: String,
         markets: Vec<MarketInfo>,
@@ -62,10 +69,15 @@ pub struct VenueFeed {
 }
 
 pub fn supported(id: &str) -> bool {
-    matches!(id, "binance" | "okx" | "bitget" | "bybit" | "gate")
+    SUPPORTED_EXCHANGES.contains(&id)
+}
+
+fn normalize_symbol(symbol: &str) -> String {
+    symbol.to_ascii_uppercase()
 }
 
 fn market_info(markets: Vec<Market>, config: &Config) -> Vec<MarketInfo> {
+    let mut seen = HashSet::new();
     let stablecoins: HashMap<_, _> = config
         .stablecoins
         .iter()
@@ -84,6 +96,9 @@ fn market_info(markets: Vec<Market>, config: &Config) -> Vec<MarketInfo> {
                 || !stablecoins.contains_key(&base)
                 || quote != "USDT"
             {
+                return None;
+            }
+            if !seen.insert(normalize_symbol(&market.symbol)) {
                 return None;
             }
             let display_base = stablecoins[&base].to_string();
@@ -137,9 +152,6 @@ impl VenueFeed {
             "gate" => {
                 let (core, markets) = gate::GateFeed::load_markets().await?;
                 let markets = market_info(markets, config);
-                if markets.is_empty() {
-                    return Err("no matching active spot markets".into());
-                }
                 let symbols: Vec<_> = markets.iter().map(|market| market.symbol.clone()).collect();
                 let client = gate::GateFeed::new(core, &symbols)?;
                 return Ok(Self::from_parts(
@@ -152,9 +164,6 @@ impl VenueFeed {
             _ => return Err(format!("unsupported exchange id: {venue}")),
         };
         let markets = market_info(markets, config);
-        if markets.is_empty() {
-            return Err("no matching active spot markets".into());
-        }
         Ok(Self::from_parts(venue, client, markets, config))
     }
 
@@ -162,7 +171,7 @@ impl VenueFeed {
         let symbols: Vec<_> = markets.iter().map(|market| market.symbol.clone()).collect();
         let markets = markets
             .into_iter()
-            .map(|market| (market.symbol.clone(), market))
+            .map(|market| (normalize_symbol(&market.symbol), market))
             .collect();
         Self {
             venue: venue.into(),
@@ -205,7 +214,7 @@ impl VenueFeed {
                 .symbol
                 .as_deref()
                 .ok_or("CCXT returned a book without a symbol")?;
-            let Some(market) = self.markets.get(symbol).cloned() else {
+            let Some(market) = self.markets.get(&normalize_symbol(symbol)).cloned() else {
                 continue;
             };
             return Ok(BookUpdate {
@@ -251,7 +260,7 @@ impl VenueFeed {
         self.symbols = symbols;
         self.markets = selected
             .into_iter()
-            .map(|market| (market.symbol.clone(), market))
+            .map(|market| (normalize_symbol(&market.symbol), market))
             .collect();
         if changed {
             eprintln!("[market] {} market list refreshed", self.venue);
@@ -308,21 +317,30 @@ pub async fn run_venue(venue: String, config: Config, tx: mpsc::Sender<FeedEvent
             markets: feed.markets(),
         })
         .await;
-    eprintln!(
-        "[market] {venue}: discovered {} eligible spot markets; connecting",
-        feed.symbols.len()
-    );
+    if feed.symbols.is_empty() {
+        eprintln!("[market] {venue}: no eligible spot markets; waiting for catalogue refresh");
+    } else {
+        eprintln!(
+            "[market] {venue}: discovered {} eligible spot markets; connecting",
+            feed.symbols.len()
+        );
+    }
     let mut live = false;
     let mut queue_full_logged = false;
     let mut refresh_at =
         tokio::time::Instant::now() + std::time::Duration::from_secs(config.market_refresh_seconds);
     loop {
-        let next = tokio::select! {
-            result = AssertUnwindSafe(feed.next()).catch_unwind() => Some(match result {
-                Ok(result) => result,
-                Err(payload) => Err(panic_reason(payload)),
-            }),
-            _ = tokio::time::sleep_until(refresh_at) => None,
+        let next = if feed.symbols.is_empty() {
+            tokio::time::sleep_until(refresh_at).await;
+            None
+        } else {
+            tokio::select! {
+                result = AssertUnwindSafe(feed.next()).catch_unwind() => Some(match result {
+                    Ok(result) => result,
+                    Err(payload) => Err(panic_reason(payload)),
+                }),
+                _ = tokio::time::sleep_until(refresh_at) => None,
+            }
         };
         match next {
             Some(Ok(book)) => {
@@ -427,6 +445,7 @@ mod tests {
         let selected = market_info(
             vec![
                 market("USDC", "USDT", true, false, true),
+                market("USDE", "USDT", true, false, true),
                 market("USDe", "USDT", true, false, true),
                 market("USDe", "USDC", true, false, true),
                 market("USDT", "USDC", true, false, true),
@@ -441,8 +460,9 @@ mod tests {
                 .iter()
                 .map(|m| m.symbol.as_str())
                 .collect::<Vec<_>>(),
-            ["USDC/USDT", "USDe/USDT"]
+            ["USDC/USDT", "USDE/USDT"]
         );
+        assert_eq!(selected[1].display_base, "USDe");
     }
 
     #[test]

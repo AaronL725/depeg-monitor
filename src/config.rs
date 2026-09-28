@@ -1,5 +1,14 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::{fs, path::Path};
+
+pub const SUPPORTED_EXCHANGES: [&str; 5] = ["binance", "okx", "bitget", "bybit", "gate"];
+pub const MONITOR_SETTINGS_PATH: &str = "state/monitor_settings.json";
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct MonitorSettings {
+    pub exchanges: Vec<String>,
+    pub stablecoins: Vec<String>,
+}
 
 #[derive(Clone, Deserialize)]
 #[serde(default)]
@@ -40,9 +49,7 @@ impl Default for TelegramConfig {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            exchanges: ["binance", "okx", "bitget", "bybit", "gate"]
-                .map(str::to_owned)
-                .into(),
+            exchanges: SUPPORTED_EXCHANGES.map(str::to_owned).into(),
             stablecoins: ["USDC", "USDe", "DAI", "FDUSD", "PYUSD"]
                 .map(str::to_owned)
                 .into(),
@@ -91,6 +98,14 @@ impl Config {
         }
         if config.state_path == config.telegram.authorized_chats_path {
             return Err("state_path and telegram.authorized_chats_path must differ".into());
+        }
+        if [
+            config.state_path.as_str(),
+            config.telegram.authorized_chats_path.as_str(),
+        ]
+        .contains(&MONITOR_SETTINGS_PATH)
+        {
+            return Err("monitor settings path must differ from other state paths".into());
         }
         Ok(config)
     }
@@ -149,6 +164,17 @@ mod tests {
             "state_path = \"state/same.json\"\n[telegram]\nauthorized_chats_path = \"state/same.json\"\n",
         )
         .unwrap();
+        assert!(Config::load(&path).is_err());
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn monitor_settings_path_must_not_overlap_other_state_files() {
+        let path = std::env::temp_dir().join(format!(
+            "depeg-config-{}-monitor-settings-path.toml",
+            std::process::id()
+        ));
+        fs::write(&path, "state_path = \"state/monitor_settings.json\"\n").unwrap();
         assert!(Config::load(&path).is_err());
         fs::remove_file(path).unwrap();
     }
